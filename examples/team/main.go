@@ -67,26 +67,10 @@ func main() {
 
 	researcherWithHandoff := &engine.SoloAgent{
 		Name:    "researcher",
-		Persona: "You are a research assistant. After gathering information, use the handoff tool to pass work to the writer. Input: {\"target\": \"writer\"}",
+		Persona: "You are a research assistant. After gathering information, hand off to the writer agent to produce the final article.",
 		Brain:   b,
-		Tools: []core.Tool{
-			ddg,
-			&core.QuickTool{
-				Name: "handoff",
-				Desc: "Transfer to another agent. Input: JSON {\"target\": \"agent_name\"}",
-				Params: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"target": map[string]any{"type": "string"},
-					},
-					"required": []string{"target"},
-				},
-				Fn: func(_ context.Context, input string) (string, error) {
-					return "handoff initiated", nil
-				},
-			},
-		},
-		Vault: mv,
+		Tools:   []core.Tool{ddg},
+		Vault:   mv,
 	}
 
 	conductor := engine.NewConductor("team", "researcher", researcherWithHandoff, writer)

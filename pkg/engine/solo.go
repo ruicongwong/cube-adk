@@ -20,6 +20,14 @@ type SoloAgent struct {
 	Gate      core.Gate   // optional HITL gate
 	Policy    core.Policy // optional gate policy
 	Tracer    core.Tracer // optional tracer
+
+	extraTools []core.Tool // injected by Conductor, not user-facing
+}
+
+// InjectTools appends tools that are managed by the framework (e.g. handoff).
+// These are merged with user-configured Tools at execution time.
+func (a *SoloAgent) InjectTools(tools ...core.Tool) {
+	a.extraTools = append(a.extraTools, tools...)
 }
 
 func (a *SoloAgent) Identity() string { return a.Name }
@@ -45,8 +53,9 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 		limit = 10
 	}
 
-	toolMap := make(map[string]core.Tool, len(a.Tools))
-	for _, t := range a.Tools {
+	allTools := append(a.Tools, a.extraTools...)
+	toolMap := make(map[string]core.Tool, len(allTools))
+	for _, t := range allTools {
 		toolMap[t.Identity()] = t
 	}
 
@@ -57,7 +66,7 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 			return
 		}
 
-		resp, err := a.Brain.Think(ctx, dialogue, a.Tools)
+		resp, err := a.Brain.Think(ctx, dialogue, allTools)
 		if err != nil {
 			emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 			return

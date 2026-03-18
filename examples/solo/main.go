@@ -76,7 +76,7 @@ func main() {
 	}
 
 	conv := runtime.NewConversation("demo", core.WithVault(mv))
-	conv.Append(core.Dialogue{Role: "user", Text: "你好"})
+	conv.Append(core.Dialogue{Role: "user", Text: "马云"})
 
 	fmt.Println("=== Solo Agent Demo ===")
 	ch, err := agent.Execute(context.Background(), conv)

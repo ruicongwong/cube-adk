@@ -21,6 +21,13 @@ type DeepAgent struct {
 	Gate      core.Gate
 	Policy    core.Policy
 	Tracer    core.Tracer
+
+	extraTools []core.Tool // injected by Conductor
+}
+
+// InjectTools appends tools that are managed by the framework (e.g. handoff).
+func (a *DeepAgent) InjectTools(tools ...core.Tool) {
+	a.extraTools = append(a.extraTools, tools...)
 }
 
 func (a *DeepAgent) Identity() string { return a.Name }
@@ -204,8 +211,9 @@ func (a *DeepAgent) synthPhase(ctx context.Context, conv *core.Conversation, pla
 
 // reactFallback runs a simple ReAct loop when recursion bottoms out.
 func (a *DeepAgent) reactFallback(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal, stepLimit int) {
-	toolMap := make(map[string]core.Tool, len(a.Tools))
-	for _, t := range a.Tools {
+	allTools := append(a.Tools, a.extraTools...)
+	toolMap := make(map[string]core.Tool, len(allTools))
+	for _, t := range allTools {
 		toolMap[t.Identity()] = t
 	}
 
@@ -220,7 +228,7 @@ func (a *DeepAgent) reactFallback(ctx context.Context, conv *core.Conversation, 
 			return
 		}
 
-		resp, err := a.Brain.Think(ctx, dialogue, a.Tools)
+		resp, err := a.Brain.Think(ctx, dialogue, allTools)
 		if err != nil {
 			emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 			return

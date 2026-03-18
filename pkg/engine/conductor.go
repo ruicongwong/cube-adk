@@ -3,9 +3,15 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"cube-adk/pkg/core"
 )
+
+// ToolInjector is implemented by agents that accept framework-managed tools (e.g. handoff).
+type ToolInjector interface {
+	InjectTools(tools ...core.Tool)
+}
 
 // Conductor orchestrates multiple agents with handoff support.
 type Conductor struct {
@@ -20,7 +26,64 @@ func NewConductor(name, entry string, agents ...core.Agent) *Conductor {
 	for _, a := range agents {
 		m[a.Identity()] = a
 	}
-	return &Conductor{Name: name, Agents: m, EntryAgent: entry}
+	c := &Conductor{Name: name, Agents: m, EntryAgent: entry}
+	c.injectHandoffTools()
+	return c
+}
+
+// injectHandoffTools auto-generates a handoff tool for each sub-agent,
+// listing all other agents as valid targets.
+func (c *Conductor) injectHandoffTools() {
+	names := make([]string, 0, len(c.Agents))
+	for n := range c.Agents {
+		names = append(names, n)
+	}
+
+	for id, agent := range c.Agents {
+		injector, ok := agent.(ToolInjector)
+		if !ok {
+			continue
+		}
+
+		// Build peer list (all agents except self)
+		var peers []string
+		for _, n := range names {
+			if n != id {
+				peers = append(peers, n)
+			}
+		}
+		if len(peers) == 0 {
+			continue
+		}
+
+		injector.InjectTools(newHandoffTool(peers))
+	}
+}
+
+// newHandoffTool creates a handoff tool that advertises the given peer agents.
+func newHandoffTool(peers []string) core.Tool {
+	desc := fmt.Sprintf(
+		"Transfer the conversation to another agent. Available targets: [%s]. Input: JSON {\"target\": \"agent_name\"}",
+		strings.Join(peers, ", "),
+	)
+	return &core.QuickTool{
+		Name: "handoff",
+		Desc: desc,
+		Params: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"target": map[string]any{
+					"type":        "string",
+					"enum":        peers,
+					"description": "The name of the agent to hand off to",
+				},
+			},
+			"required": []string{"target"},
+		},
+		Fn: func(_ context.Context, input string) (string, error) {
+			return "handoff initiated", nil
+		},
+	}
 }
 
 func (c *Conductor) Identity() string { return c.Name }
