@@ -1,0 +1,5 @@
+.idea/
+.claude/
+*.exe
+*.test
+*.out
