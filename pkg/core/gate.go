@@ -14,17 +14,17 @@ const (
 // Review is the human's response to a checkpoint.
 type Review struct {
 	Verdict  Verdict
-	Modified string // non-empty when Verdict == Modify
+	Modified string
 	Reason   string
 }
 
 // Checkpoint describes an action awaiting human approval.
 type Checkpoint struct {
-	Agent  string // agent identity
-	Kind   string // "tool" | "handoff" | "plan" | "reply"
-	Tool   string // tool name (when Kind == "tool")
-	Input  string // content to review (args / plan / reply text)
-	Signal Signal // the original signal being gated
+	Agent  string
+	Kind   string
+	Tool   string
+	Input  string
+	Signal Signal
 }
 
 // Gate blocks execution until a human provides a verdict.

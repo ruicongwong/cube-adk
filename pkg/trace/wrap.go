@@ -3,90 +3,85 @@ package trace
 import (
 	"context"
 
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
 )
 
-// WrapBrain returns a Brain that creates trace spans around Think calls.
-func WrapBrain(b core.Brain, t core.Tracer) core.Brain {
+// WrapModel returns a Model that creates trace spans around Generate calls.
+func WrapModel(m component.Model, t core.Tracer) component.Model {
 	if t == nil {
-		return b
+		return m
 	}
-	return &tracedBrain{inner: b, tracer: t}
+	return &tracedModel{inner: m, tracer: t}
 }
 
-type tracedBrain struct {
-	inner  core.Brain
+type tracedModel struct {
+	inner  component.Model
 	tracer core.Tracer
 }
 
-func (tb *tracedBrain) Think(ctx context.Context, dialogue []core.Dialogue, tools []core.Tool) (*core.Dialogue, error) {
-	ctx, span := tb.tracer.Start(ctx, "brain.think", core.SpanBrain)
-	span.SetAttr("dialogue.len", len(dialogue))
-	span.SetAttr("tools.count", len(tools))
-	resp, err := tb.inner.Think(ctx, dialogue, tools)
-	if resp != nil {
-		if resp.Usage != nil {
-			span.SetAttr("llm.prompt_tokens", resp.Usage.PromptTokens)
-			span.SetAttr("llm.completion_tokens", resp.Usage.CompletionTokens)
-			span.SetAttr("llm.total_tokens", resp.Usage.TotalTokens)
-		}
-		if resp.TTFT > 0 {
-			span.SetAttr("llm.ttft_ms", resp.TTFT.Milliseconds())
-		}
+func (tm *tracedModel) Generate(ctx context.Context, msgs []*protocol.Message, opts ...option.ModelOption) (*protocol.Message, error) {
+	ctx, span := tm.tracer.Start(ctx, "model.generate", core.SpanBrain)
+	span.SetAttr("messages.len", len(msgs))
+	resp, err := tm.inner.Generate(ctx, msgs, opts...)
+	if resp != nil && resp.TokenUsage != nil {
+		span.SetAttr("llm.prompt_tokens", resp.TokenUsage.PromptTokens)
+		span.SetAttr("llm.completion_tokens", resp.TokenUsage.CompletionTokens)
+		span.SetAttr("llm.total_tokens", resp.TokenUsage.TotalTokens)
 	}
 	span.End(err)
 	return resp, err
 }
 
-// WrapTool returns a Tool that creates trace spans around Perform calls.
-// If the inner tool implements ArtifactTool, the wrapper preserves that.
-func WrapTool(tool core.Tool, t core.Tracer) core.Tool {
-	if t == nil {
-		return tool
+func (tm *tracedModel) Stream(ctx context.Context, msgs []*protocol.Message, opts ...option.ModelOption) (*protocol.StreamReader[*protocol.Message], error) {
+	_, span := tm.tracer.Start(ctx, "model.stream", core.SpanBrain)
+	span.SetAttr("messages.len", len(msgs))
+	r, err := tm.inner.Stream(ctx, msgs, opts...)
+	if err != nil {
+		span.End(err)
+		return nil, err
 	}
-	tt := &tracedTool{inner: tool, tracer: t}
-	if at, ok := tool.(core.ArtifactTool); ok {
-		return &tracedArtifactTool{tracedTool: tt, inner: at}
+	// Note: span will not be ended until stream is consumed
+	return r, nil
+}
+
+// WrapTool returns a Tool that creates trace spans around Run calls.
+func WrapTool(t component.Tool, tr core.Tracer) component.Tool {
+	if tr == nil {
+		return t
 	}
-	return tt
+	return &tracedTool{inner: t, tracer: tr}
 }
 
 // WrapTools wraps a slice of tools with tracing.
-func WrapTools(tools []core.Tool, t core.Tracer) []core.Tool {
+func WrapTools(tools []component.Tool, t core.Tracer) []component.Tool {
 	if t == nil {
 		return tools
 	}
-	out := make([]core.Tool, len(tools))
-	for i, tool := range tools {
-		out[i] = WrapTool(tool, t)
+	out := make([]component.Tool, len(tools))
+	for i, tl := range tools {
+		out[i] = WrapTool(tl, t)
 	}
 	return out
 }
 
 type tracedTool struct {
-	inner  core.Tool
+	inner  component.Tool
 	tracer core.Tracer
 }
 
-func (tt *tracedTool) Identity() string       { return tt.inner.Identity() }
-func (tt *tracedTool) Brief() string          { return tt.inner.Brief() }
-func (tt *tracedTool) Schema() map[string]any { return tt.inner.Schema() }
+func (tt *tracedTool) Identity() string        { return tt.inner.Identity() }
+func (tt *tracedTool) Brief() string           { return tt.inner.Brief() }
+func (tt *tracedTool) Spec() protocol.ToolSpec { return tt.inner.Spec() }
 
-func (tt *tracedTool) Perform(ctx context.Context, input string) (string, error) {
+func (tt *tracedTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
 	ctx, span := tt.tracer.Start(ctx, "tool."+tt.inner.Identity(), core.SpanTool)
-	span.SetAttr("input", input)
-	out, err := tt.inner.Perform(ctx, input)
-	span.SetAttr("output.len", len(out))
+	span.SetAttr("tool.call_id", call.ID)
+	span.SetAttr("tool.name", call.Name)
+	result, err := tt.inner.Run(ctx, call, opts...)
+	span.SetAttr("tool.failed", result.Failed)
 	span.End(err)
-	return out, err
-}
-
-// tracedArtifactTool preserves ArtifactTool interface through tracing.
-type tracedArtifactTool struct {
-	*tracedTool
-	inner core.ArtifactTool
-}
-
-func (t *tracedArtifactTool) Artifacts() []core.ArtifactDetail {
-	return t.inner.Artifacts()
+	return result, err
 }

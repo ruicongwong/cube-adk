@@ -11,27 +11,40 @@ import (
 	"strings"
 	"text/template"
 
-	"cube-adk/pkg/core"
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
 )
 
 var pathParamRe = regexp.MustCompile(`\{(\w+)\}`)
 var tplFieldRe = regexp.MustCompile(`\{\{\.(\w+)\}\}`)
 
-// restTool wraps a RESTSpec into a Tool.
+// RESTSpec declaratively describes an HTTP endpoint to be wrapped as a Tool.
+type RESTSpec struct {
+	Name        string
+	Desc        string
+	Method      string
+	URL         string
+	Headers     map[string]string
+	QueryParams map[string]string
+	BodyTpl     string
+	ResultPath  string
+}
+
+// restTool wraps a RESTSpec into a component.Tool.
 type restTool struct {
-	spec   core.RESTSpec
+	spec   RESTSpec
 	schema map[string]any
 	tpl    *template.Template
 	client *http.Client
 }
 
 // NewRESTTool creates a Tool from a RESTSpec declaration.
-func NewRESTTool(spec core.RESTSpec) core.Tool {
+func NewRESTTool(spec RESTSpec) *restTool {
 	return NewRESTToolWithClient(spec, &http.Client{})
 }
 
 // NewRESTToolWithClient creates a RESTTool with a custom http.Client.
-func NewRESTToolWithClient(spec core.RESTSpec, client *http.Client) core.Tool {
+func NewRESTToolWithClient(spec RESTSpec, client *http.Client) *restTool {
 	t := &restTool{spec: spec, client: client}
 	t.schema = t.buildSchema()
 	if spec.BodyTpl != "" {
@@ -40,9 +53,12 @@ func NewRESTToolWithClient(spec core.RESTSpec, client *http.Client) core.Tool {
 	return t
 }
 
-func (t *restTool) Identity() string       { return t.spec.Name }
-func (t *restTool) Brief() string          { return t.spec.Desc }
-func (t *restTool) Schema() map[string]any { return t.schema }
+func (t *restTool) Identity() string { return t.spec.Name }
+func (t *restTool) Brief() string    { return t.spec.Desc }
+
+func (t *restTool) Spec() protocol.ToolSpec {
+	return protocol.ToolSpec{Name: t.spec.Name, Desc: t.spec.Desc, Schema: t.schema}
+}
 
 func (t *restTool) buildSchema() map[string]any {
 	props := map[string]any{}
@@ -65,17 +81,17 @@ func (t *restTool) buildSchema() map[string]any {
 	}
 }
 
-func (t *restTool) Perform(ctx context.Context, input string) (string, error) {
+func (t *restTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
 	var args map[string]string
-	if err := json.Unmarshal([]byte(input), &args); err != nil {
-		return "", fmt.Errorf("resttool: parse args: %w", err)
+	if err := json.Unmarshal([]byte(call.Args), &args); err != nil {
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: parse args: %w", err)), nil
 	}
 
 	url := t.spec.URL
 	for _, m := range pathParamRe.FindAllStringSubmatch(url, -1) {
 		val, ok := args[m[1]]
 		if !ok {
-			return "", fmt.Errorf("resttool: missing path param %q", m[1])
+			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: missing path param %q", m[1])), nil
 		}
 		url = strings.Replace(url, m[0], val, 1)
 	}
@@ -95,14 +111,14 @@ func (t *restTool) Perform(ctx context.Context, input string) (string, error) {
 	if t.tpl != nil {
 		var buf bytes.Buffer
 		if err := t.tpl.Execute(&buf, args); err != nil {
-			return "", fmt.Errorf("resttool: render body: %w", err)
+			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: render body: %w", err)), nil
 		}
 		bodyReader = &buf
 	}
 
 	req, err := http.NewRequestWithContext(ctx, t.spec.Method, url, bodyReader)
 	if err != nil {
-		return "", err
+		return protocol.NewErrorResult(call.ID, err), nil
 	}
 	for k, v := range t.spec.Headers {
 		req.Header.Set(k, v)
@@ -113,19 +129,20 @@ func (t *restTool) Perform(ctx context.Context, input string) (string, error) {
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("resttool: http: %w", err)
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: http: %w", err)), nil
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("resttool: read response: %w", err)
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: read: %w", err)), nil
 	}
 
-	if t.spec.ResultPath == "" {
-		return string(data), nil
+	output := string(data)
+	if t.spec.ResultPath != "" {
+		output, _ = extractPath(data, t.spec.ResultPath)
 	}
-	return extractPath(data, t.spec.ResultPath)
+	return protocol.NewTextResult(call.ID, output), nil
 }
 
 func extractPath(data []byte, path string) (string, error) {

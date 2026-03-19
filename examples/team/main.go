@@ -6,8 +6,10 @@ import (
 	"os"
 
 	"cube-adk/pkg/brain"
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
 	"cube-adk/pkg/engine"
+	"cube-adk/pkg/protocol"
 	"cube-adk/pkg/runtime"
 	"cube-adk/pkg/tool"
 	"cube-adk/pkg/vault"
@@ -23,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := brain.NewOAI(endpoint, secret, model)
+	m := brain.NewOpenAIModel(endpoint, secret, model)
 	mv := vault.NewMemVault()
 
 	ddg := tool.NewDuckDuckGoTool()
@@ -34,15 +36,15 @@ func main() {
 	researcher := &engine.SoloAgent{
 		Name:    "researcher",
 		Persona: "You are a research assistant. Use the ddg_search tool to find relevant information, then summarize your findings.",
-		Brain:   b,
-		Tools:   []core.Tool{ddg},
+		Model:   m,
+		Tools:   []component.Tool{ddg},
 		Vault:   mv,
 	}
 
 	writer := &engine.SoloAgent{
 		Name:    "writer",
 		Persona: "You are a professional writer. Take the research provided and write a well-structured article. Reply in the user's language.",
-		Brain:   b,
+		Model:   m,
 		Tools:   nil,
 		Vault:   mv,
 	}
@@ -52,10 +54,10 @@ func main() {
 		Agents: []core.Agent{researcher, writer},
 	}
 
-	conv := runtime.NewConversation("team-demo", core.WithVault(mv))
-	conv.Append(core.Dialogue{Role: "user", Text: "Write an article about the latest AI developments"})
+	sess := runtime.NewSession("team-demo", core.WithVault(mv))
+	sess.Append(protocol.NewTextMessage("user", "Write an article about the latest AI developments"))
 
-	ch, err := chain.Execute(context.Background(), conv)
+	ch, err := chain.Execute(context.Background(), sess)
 	if err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
@@ -68,17 +70,17 @@ func main() {
 	researcherWithHandoff := &engine.SoloAgent{
 		Name:    "researcher",
 		Persona: "You are a research assistant. After gathering information, hand off to the writer agent to produce the final article.",
-		Brain:   b,
-		Tools:   []core.Tool{ddg},
+		Model:   m,
+		Tools:   []component.Tool{ddg},
 		Vault:   mv,
 	}
 
 	conductor := engine.NewConductor("team", "researcher", researcherWithHandoff, writer)
 
-	conv2 := runtime.NewConversation("conductor-demo", core.WithVault(mv))
-	conv2.Append(core.Dialogue{Role: "user", Text: "Research and write about quantum computing breakthroughs"})
+	sess2 := runtime.NewSession("conductor-demo", core.WithVault(mv))
+	sess2.Append(protocol.NewTextMessage("user", "Research and write about quantum computing breakthroughs"))
 
-	ch2, err := conductor.Execute(context.Background(), conv2)
+	ch2, err := conductor.Execute(context.Background(), sess2)
 	if err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
@@ -91,16 +93,16 @@ func main() {
 	deep := &engine.DeepAgent{
 		Name:     "deep-researcher",
 		Persona:  "You are a thorough research assistant. Break complex tasks into subtasks and solve them step by step. Reply in the user's language.",
-		Brain:    b,
-		Tools:    []core.Tool{ddg},
+		Model:    m,
+		Tools:    []component.Tool{ddg},
 		Vault:    mv,
 		MaxDepth: 2,
 	}
 
-	conv3 := runtime.NewConversation("deep-demo", core.WithVault(mv))
-	conv3.Append(core.Dialogue{Role: "user", Text: "Compare the AI strategies of major tech companies in 2025"})
+	sess3 := runtime.NewSession("deep-demo", core.WithVault(mv))
+	sess3.Append(protocol.NewTextMessage("user", "Compare the AI strategies of major tech companies in 2025"))
 
-	ch3, err := deep.Execute(context.Background(), conv3)
+	ch3, err := deep.Execute(context.Background(), sess3)
 	if err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
@@ -121,7 +123,7 @@ func printSignals(ch <-chan core.Signal) {
 			if sig.Yield.Failed {
 				status = "FAILED"
 			}
-			fmt.Printf(": [%s] %s", status, sig.Yield.Output)
+			fmt.Printf(": [%s] %s", status, sig.Yield.TextOf())
 		case core.SignalHandoff:
 			fmt.Printf(": → %s", sig.Handoff)
 		case core.SignalRecall:

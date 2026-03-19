@@ -1,12 +1,15 @@
 package core
 
-import "time"
+import (
+	"cube-adk/pkg/protocol"
+	"time"
+)
 
 // SignalKind identifies the type of event in an agent execution stream.
 type SignalKind int
 
 const (
-	SignalThink   SignalKind = iota // LLM reasoning step
+	SignalThink    SignalKind = iota // LLM reasoning step
 	SignalInvoke                    // tool invocation request
 	SignalYield                     // tool execution result
 	SignalReply                     // final text reply
@@ -50,49 +53,21 @@ func (k SignalKind) String() string {
 
 // Signal is the event unit emitted during agent execution.
 type Signal struct {
-	Kind    SignalKind
-	Source  string       // agent identity that produced this signal
-	Text    string       // human-readable content (think / reply / fault)
-	Invoke  *InvokeDetail
-	Yield   *YieldDetail
-	Handoff string       // target agent identity for handoff
+	Kind     SignalKind
+	Source   string               // agent identity that produced this signal
+	Text     string               // human-readable content (think / reply / fault)
+	Invoke   *protocol.ToolCall   // tool invocation request
+	Yield    *protocol.ToolResult // tool execution result
+	Handoff  string               // target agent identity for handoff
 	Recall   *RecallDetail
-	Plan     *PlanDetail     // deep agent plan
-	Artifact *ArtifactDetail // produced artifact
-	TraceID  string          // optional trace correlation
-	SpanID   string          // optional span correlation
+	Plan     *PlanDetail
+	Artifact *ArtifactDetail
+	TraceID  string
+	SpanID   string
 }
 
 // Usage holds token consumption reported by the LLM.
-type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-}
-
-// Dialogue represents a single message in a conversation.
-type Dialogue struct {
-	Role        string         // "system" | "user" | "assistant" | "tool"
-	Text        string
-	Invocations []InvokeDetail // tool calls made by assistant
-	InvokeRef   string         // tool_call_id for role=tool
-	Usage       *Usage         // LLM token usage (assistant messages only)
-	TTFT        time.Duration  // time to first token (assistant messages only)
-}
-
-// InvokeDetail describes a tool invocation request from the LLM.
-type InvokeDetail struct {
-	ID   string // tool_call_id
-	Name string // tool name
-	Args string // JSON arguments
-}
-
-// YieldDetail describes the result of a tool execution.
-type YieldDetail struct {
-	RefID  string // corresponding tool_call_id
-	Output string
-	Failed bool
-}
+type Usage = protocol.Usage
 
 // RecallDetail describes memory recall results.
 type RecallDetail struct {
@@ -116,26 +91,26 @@ type PlanDetail struct {
 type SubTask struct {
 	ID          string
 	Description string
-	Result      string // filled after execution
+	Result      string
 	Done        bool
 }
 
 // ArtifactDetail describes a rich output produced during execution.
 type ArtifactDetail struct {
-	ID   string            // unique identifier
-	Name string            // human-readable name ("report.html")
-	MIME string            // MIME type ("text/html", "image/png", "application/json")
-	Data []byte            // raw content
-	Meta map[string]string // optional metadata
+	ID   string
+	Name string
+	MIME string
+	Data []byte
+	Meta map[string]string
 }
 
 // Scope defines the lifetime tier of a memory entry.
 type Scope int
 
 const (
-	ScopeWorking Scope = iota // current task context
-	ScopeShort                // session-level
-	ScopeLong                 // persistent across sessions
+	ScopeWorking Scope = iota
+	ScopeShort
+	ScopeLong
 )
 
 // Entry is a memory record to be stored in a Vault.

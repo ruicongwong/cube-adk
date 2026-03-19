@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"strings"
 
+	"cube-adk/pkg/callback"
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
+	"cube-adk/pkg/tool"
 )
 
-// ToolInjector is implemented by agents that accept framework-managed tools (e.g. handoff).
+// ToolInjector is implemented by agents that accept framework-managed tools.
 type ToolInjector interface {
-	InjectTools(tools ...core.Tool)
+	InjectTools(tools ...component.Tool)
 }
 
 // Conductor orchestrates multiple agents with handoff support.
@@ -31,8 +36,6 @@ func NewConductor(name, entry string, agents ...core.Agent) *Conductor {
 	return c
 }
 
-// injectHandoffTools auto-generates a handoff tool for each sub-agent,
-// listing all other agents as valid targets.
 func (c *Conductor) injectHandoffTools() {
 	names := make([]string, 0, len(c.Agents))
 	for n := range c.Agents {
@@ -45,7 +48,6 @@ func (c *Conductor) injectHandoffTools() {
 			continue
 		}
 
-		// Build peer list (all agents except self)
 		var peers []string
 		for _, n := range names {
 			if n != id {
@@ -60,13 +62,12 @@ func (c *Conductor) injectHandoffTools() {
 	}
 }
 
-// newHandoffTool creates a handoff tool that advertises the given peer agents.
-func newHandoffTool(peers []string) core.Tool {
+func newHandoffTool(peers []string) component.Tool {
 	desc := fmt.Sprintf(
 		"Transfer the conversation to another agent. Available targets: [%s]. Input: JSON {\"target\": \"agent_name\"}",
 		strings.Join(peers, ", "),
 	)
-	return &core.QuickTool{
+	return &tool.QuickTool{
 		Name: "handoff",
 		Desc: desc,
 		Params: map[string]any{
@@ -88,14 +89,18 @@ func newHandoffTool(peers []string) core.Tool {
 
 func (c *Conductor) Identity() string { return c.Name }
 
-func (c *Conductor) Execute(ctx context.Context, conv *core.Conversation) (<-chan core.Signal, error) {
+func (c *Conductor) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
 	ch := make(chan core.Signal, 16)
-	go c.run(ctx, conv, ch)
+	go c.run(ctx, sess, ch)
 	return ch, nil
 }
 
-func (c *Conductor) run(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal) {
+func (c *Conductor) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal) {
 	defer close(ch)
+
+	info := callback.RunInfo{Name: c.Name, Kind: "agent", Component: component.KindModel}
+	ctx = callback.OnStart(ctx, info, sess)
+	defer func() { callback.OnEnd(ctx, info, nil) }()
 
 	var span core.Span
 	if c.Tracer != nil {
@@ -125,7 +130,7 @@ func (c *Conductor) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 			return
 		}
 
-		sub, err := agent.Execute(ctx, conv)
+		sub, err := agent.Execute(ctx, sess)
 		if err != nil {
 			ch <- core.Signal{Kind: core.SignalFault, Source: c.Name, Text: err.Error()}
 			return
@@ -140,42 +145,45 @@ func (c *Conductor) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 		}
 
 		if handoff == "" {
-			return // no handoff, done
+			return
 		}
 		current = handoff
 	}
 }
 
-// AsTool wraps an Agent as a Tool so it can be used by other agents.
-func AsTool(agent core.Agent) core.Tool {
+// AsTool wraps an Agent as a component.Tool so it can be used by other agents.
+func AsTool(agent core.Agent) component.Tool {
 	return &agentTool{agent: agent}
 }
 
 type agentTool struct {
-	agent     core.Agent
-	artifacts []core.ArtifactDetail
+	agent core.Agent
 }
 
-func (t *agentTool) Identity() string       { return t.agent.Identity() }
-func (t *agentTool) Brief() string          { return "Delegate to agent: " + t.agent.Identity() }
-func (t *agentTool) Schema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"input": map[string]any{"type": "string", "description": "The task to delegate"},
+func (t *agentTool) Identity() string { return t.agent.Identity() }
+func (t *agentTool) Brief() string    { return "Delegate to agent: " + t.agent.Identity() }
+
+func (t *agentTool) Spec() protocol.ToolSpec {
+	return protocol.ToolSpec{
+		Name: t.agent.Identity(),
+		Desc: t.Brief(),
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"input": map[string]any{"type": "string", "description": "The task to delegate"},
+			},
+			"required": []string{"input"},
 		},
-		"required": []string{"input"},
 	}
 }
 
-func (t *agentTool) Perform(ctx context.Context, input string) (string, error) {
-	t.artifacts = nil
-	conv := core.NewConversation("delegate")
-	conv.Append(core.Dialogue{Role: "user", Text: input})
+func (t *agentTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
+	sess := core.NewSession("delegate")
+	sess.Append(protocol.NewTextMessage("user", call.Args))
 
-	ch, err := t.agent.Execute(ctx, conv)
+	ch, err := t.agent.Execute(ctx, sess)
 	if err != nil {
-		return "", err
+		return protocol.NewErrorResult(call.ID, err), nil
 	}
 
 	var reply string
@@ -183,11 +191,6 @@ func (t *agentTool) Perform(ctx context.Context, input string) (string, error) {
 		if sig.Kind == core.SignalReply {
 			reply = sig.Text
 		}
-		if sig.Kind == core.SignalArtifact && sig.Artifact != nil {
-			t.artifacts = append(t.artifacts, *sig.Artifact)
-		}
 	}
-	return reply, nil
+	return protocol.NewTextResult(call.ID, reply), nil
 }
-
-func (t *agentTool) Artifacts() []core.ArtifactDetail { return t.artifacts }

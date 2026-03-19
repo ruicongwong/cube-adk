@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
 )
 
 // DuckDuckGoTool searches the web using the DuckDuckGo Instant Answer API.
-// No API key required.
 type DuckDuckGoTool struct {
 	Client *http.Client
 }
@@ -24,32 +26,37 @@ func (d *DuckDuckGoTool) Identity() string { return "ddg_search" }
 func (d *DuckDuckGoTool) Brief() string {
 	return "Search the web using DuckDuckGo. Input: JSON {\"query\": \"search terms\"}"
 }
-func (d *DuckDuckGoTool) Schema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query": map[string]any{"type": "string", "description": "search query"},
+
+func (d *DuckDuckGoTool) Spec() protocol.ToolSpec {
+	return protocol.ToolSpec{
+		Name: "ddg_search",
+		Desc: d.Brief(),
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string", "description": "search query"},
+			},
+			"required": []string{"query"},
 		},
-		"required": []string{"query"},
 	}
 }
 
-func (d *DuckDuckGoTool) Perform(ctx context.Context, input string) (string, error) {
+func (d *DuckDuckGoTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
 	var args struct {
 		Query string `json:"query"`
 	}
-	if err := json.Unmarshal([]byte(input), &args); err != nil {
-		return "", fmt.Errorf("ddg: parse args: %w", err)
+	if err := json.Unmarshal([]byte(call.Args), &args); err != nil {
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: parse args: %w", err)), nil
 	}
 	if args.Query == "" {
-		return "", fmt.Errorf("ddg: empty query")
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: empty query")), nil
 	}
 
 	apiURL := "https://api.duckduckgo.com/?q=" + url.QueryEscape(args.Query) + "&format=json&no_html=1&skip_disambig=1"
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return "", err
+		return protocol.NewErrorResult(call.ID, err), nil
 	}
 	req.Header.Set("User-Agent", "cube-adk/1.0")
 
@@ -59,16 +66,20 @@ func (d *DuckDuckGoTool) Perform(ctx context.Context, input string) (string, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("ddg: http: %w", err)
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: http: %w", err)), nil
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("ddg: read body: %w", err)
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: read body: %w", err)), nil
 	}
 
-	return formatDDGResponse(body, args.Query)
+	output, err := formatDDGResponse(body, args.Query)
+	if err != nil {
+		return protocol.NewErrorResult(call.ID, err), nil
+	}
+	return protocol.NewTextResult(call.ID, output), nil
 }
 
 type ddgResponse struct {

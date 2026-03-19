@@ -6,15 +6,19 @@ import (
 	"fmt"
 	"strings"
 
+	"cube-adk/pkg/callback"
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
 )
 
 // DeepAgent implements a recursive plan-decompose-execute-synthesize pattern.
 type DeepAgent struct {
 	Name      string
 	Persona   string
-	Brain     core.Brain
-	Tools     []core.Tool
+	Model     component.Model
+	Tools     []component.Tool
 	Vault     core.Vault
 	MaxDepth  int
 	StepLimit int
@@ -22,24 +26,27 @@ type DeepAgent struct {
 	Policy    core.Policy
 	Tracer    core.Tracer
 
-	extraTools []core.Tool // injected by Conductor
+	extraTools []component.Tool
 }
 
-// InjectTools appends tools that are managed by the framework (e.g. handoff).
-func (a *DeepAgent) InjectTools(tools ...core.Tool) {
+func (a *DeepAgent) InjectTools(tools ...component.Tool) {
 	a.extraTools = append(a.extraTools, tools...)
 }
 
 func (a *DeepAgent) Identity() string { return a.Name }
 
-func (a *DeepAgent) Execute(ctx context.Context, conv *core.Conversation) (<-chan core.Signal, error) {
+func (a *DeepAgent) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
 	ch := make(chan core.Signal, 32)
-	go a.run(ctx, conv, ch, 0)
+	go a.run(ctx, sess, ch, 0)
 	return ch, nil
 }
 
-func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal, depth int) {
+func (a *DeepAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal, depth int) {
 	defer close(ch)
+
+	info := callback.RunInfo{Name: a.Name, Kind: "agent", Component: component.KindModel}
+	ctx = callback.OnStart(ctx, info, sess)
+	defer func() { callback.OnEnd(ctx, info, nil) }()
 
 	var span core.Span
 	if a.Tracer != nil {
@@ -56,14 +63,14 @@ func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 		stepLimit = 10
 	}
 
-	plan, err := a.planPhase(ctx, conv, ch)
+	plan, err := a.planPhase(ctx, sess)
 	if err != nil {
 		emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 		return
 	}
 
 	if len(plan.Tasks) == 0 || depth >= maxDepth {
-		a.reactFallback(ctx, conv, ch, stepLimit)
+		a.reactFallback(ctx, sess, ch, stepLimit)
 		return
 	}
 
@@ -72,7 +79,6 @@ func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 		Plan: &plan, Text: formatPlan(plan),
 	})
 
-	// Gate: review plan before execution
 	if a.deepGateNeeded("plan") {
 		emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "plan"})
 		review, err := a.Gate.Check(ctx, core.Checkpoint{
@@ -102,7 +108,7 @@ func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 		}
 	}
 
-	finalAnswer, err := a.synthPhase(ctx, conv, plan, ch)
+	finalAnswer, err := a.synthPhase(ctx, sess, plan)
 	if err != nil {
 		emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 		return
@@ -110,7 +116,7 @@ func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 
 	emit(ch, core.Signal{Kind: core.SignalSynth, Source: a.Name, Text: "Synthesizing results..."})
 	emit(ch, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: finalAnswer})
-	conv.Append(core.Dialogue{Role: "assistant", Text: finalAnswer})
+	sess.Append(protocol.NewTextMessage("assistant", finalAnswer))
 
 	if a.Vault != nil {
 		_ = a.Vault.Append(ctx, core.Entry{
@@ -119,8 +125,8 @@ func (a *DeepAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 	}
 }
 
-func (a *DeepAgent) planPhase(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal) (core.PlanDetail, error) {
-	history := conv.History()
+func (a *DeepAgent) planPhase(ctx context.Context, sess *core.Session) (core.PlanDetail, error) {
+	history := sess.History()
 	query := lastUserQuery(history)
 
 	planPrompt := fmt.Sprintf(
@@ -131,18 +137,18 @@ Task: %s
 
 Respond ONLY with a JSON array of strings, e.g.: ["subtask 1", "subtask 2", "subtask 3"]`, query)
 
-	dialogue := []core.Dialogue{
-		{Role: "system", Text: a.Persona},
-		{Role: "user", Text: planPrompt},
+	msgs := []*protocol.Message{
+		protocol.NewTextMessage("system", a.Persona),
+		protocol.NewTextMessage("user", planPrompt),
 	}
 
-	resp, err := a.Brain.Think(ctx, dialogue, nil)
+	resp, err := a.Model.Generate(ctx, msgs)
 	if err != nil {
 		return core.PlanDetail{}, fmt.Errorf("deep: plan phase: %w", err)
 	}
 
 	var descriptions []string
-	text := strings.TrimSpace(resp.Text)
+	text := strings.TrimSpace(resp.TextOf())
 	if err := json.Unmarshal([]byte(text), &descriptions); err != nil {
 		text = stripCodeBlock(text)
 		if err := json.Unmarshal([]byte(text), &descriptions); err != nil {
@@ -160,17 +166,17 @@ Respond ONLY with a JSON array of strings, e.g.: ["subtask 1", "subtask 2", "sub
 }
 
 func (a *DeepAgent) executeSubtask(ctx context.Context, task *core.SubTask, ch chan<- core.Signal, depth int) (string, error) {
-	subConv := core.NewConversation(task.ID)
-	subConv.Append(core.Dialogue{Role: "user", Text: task.Description})
+	subSess := core.NewSession(task.ID)
+	subSess.Append(protocol.NewTextMessage("user", task.Description))
 
 	child := &DeepAgent{
-		Name: task.ID, Persona: a.Persona, Brain: a.Brain,
+		Name: task.ID, Persona: a.Persona, Model: a.Model,
 		Tools: a.Tools, Vault: a.Vault, MaxDepth: a.MaxDepth,
 		StepLimit: a.StepLimit, Gate: a.Gate, Policy: a.Policy, Tracer: a.Tracer,
 	}
 
 	subCh := make(chan core.Signal, 32)
-	go child.run(ctx, subConv, subCh, depth)
+	go child.run(ctx, subSess, subCh, depth)
 
 	var result string
 	for sig := range subCh {
@@ -182,8 +188,8 @@ func (a *DeepAgent) executeSubtask(ctx context.Context, task *core.SubTask, ch c
 	return result, nil
 }
 
-func (a *DeepAgent) synthPhase(ctx context.Context, conv *core.Conversation, plan core.PlanDetail, ch chan<- core.Signal) (string, error) {
-	history := conv.History()
+func (a *DeepAgent) synthPhase(ctx context.Context, sess *core.Session, plan core.PlanDetail) (string, error) {
+	history := sess.History()
 	query := lastUserQuery(history)
 
 	var sb strings.Builder
@@ -197,104 +203,92 @@ func (a *DeepAgent) synthPhase(ctx context.Context, conv *core.Conversation, pla
 	}
 	sb.WriteString("\nPlease synthesize all subtask results into a comprehensive final answer for the original task.")
 
-	dialogue := []core.Dialogue{
-		{Role: "system", Text: a.Persona},
-		{Role: "user", Text: sb.String()},
+	msgs := []*protocol.Message{
+		protocol.NewTextMessage("system", a.Persona),
+		protocol.NewTextMessage("user", sb.String()),
 	}
 
-	resp, err := a.Brain.Think(ctx, dialogue, nil)
+	resp, err := a.Model.Generate(ctx, msgs)
 	if err != nil {
 		return "", fmt.Errorf("deep: synth phase: %w", err)
 	}
-	return resp.Text, nil
+	return resp.TextOf(), nil
 }
 
-// reactFallback runs a simple ReAct loop when recursion bottoms out.
-func (a *DeepAgent) reactFallback(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal, stepLimit int) {
+func (a *DeepAgent) reactFallback(ctx context.Context, sess *core.Session, ch chan<- core.Signal, stepLimit int) {
 	allTools := append(a.Tools, a.extraTools...)
-	toolMap := make(map[string]core.Tool, len(allTools))
+	toolMap := make(map[string]component.Tool, len(allTools))
+	specs := make([]protocol.ToolSpec, 0, len(allTools))
 	for _, t := range allTools {
 		toolMap[t.Identity()] = t
+		specs = append(specs, t.Spec())
 	}
 
-	var dialogue []core.Dialogue
+	var msgs []*protocol.Message
 	if a.Persona != "" {
-		dialogue = append(dialogue, core.Dialogue{Role: "system", Text: a.Persona})
+		msgs = append(msgs, protocol.NewTextMessage("system", a.Persona))
 	}
-	dialogue = append(dialogue, conv.History()...)
+	msgs = append(msgs, sess.History()...)
 
 	for step := 0; step < stepLimit; step++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		resp, err := a.Brain.Think(ctx, dialogue, allTools)
+		resp, err := a.Model.Generate(ctx, msgs, option.WithToolSpecs(specs...))
 		if err != nil {
 			emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 			return
 		}
 
-		if len(resp.Invocations) == 0 {
-			emit(ch, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: resp.Text})
-			conv.Append(core.Dialogue{Role: "assistant", Text: resp.Text})
+		if len(resp.ToolCalls) == 0 {
+			emit(ch, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: resp.TextOf()})
+			sess.Append(protocol.NewTextMessage("assistant", resp.TextOf()))
 			return
 		}
 
-		if resp.Text != "" {
-			emit(ch, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: resp.Text})
+		if text := resp.TextOf(); text != "" {
+			emit(ch, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: text})
 		}
-		dialogue = append(dialogue, *resp)
+		msgs = append(msgs, resp)
 
-		for _, inv := range resp.Invocations {
+		for _, tc := range resp.ToolCalls {
 			emit(ch, core.Signal{
 				Kind: core.SignalInvoke, Source: a.Name,
-				Invoke: &core.InvokeDetail{ID: inv.ID, Name: inv.Name, Args: inv.Args},
+				Invoke: &protocol.ToolCall{ID: tc.ID, Kind: tc.Kind, Name: tc.Name, Args: tc.Args},
 			})
 
-			t, ok := toolMap[inv.Name]
+			t, ok := toolMap[tc.Name]
 			if !ok {
-				yd := core.YieldDetail{RefID: inv.ID, Output: fmt.Sprintf("unknown tool: %s", inv.Name), Failed: true}
-				emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-				dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: yd.Output})
+				result := protocol.NewErrorResult(tc.ID, fmt.Errorf("unknown tool: %s", tc.Name))
+				emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+				msgs = append(msgs, toolResultMsg(result))
 				continue
 			}
 
-			// Gate: review tool call
-			args := inv.Args
+			callToRun := tc
 			if a.deepGateNeeded("tool") {
-				cp := core.Checkpoint{Agent: a.Name, Kind: "tool", Tool: inv.Name, Input: args}
+				cp := core.Checkpoint{Agent: a.Name, Kind: "tool", Tool: tc.Name, Input: tc.Args}
 				if a.Policy.NeedsReview(cp) {
-					emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + inv.Name})
+					emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + tc.Name})
 					review, err := a.Gate.Check(ctx, cp)
 					if err == nil {
 						switch review.Verdict {
 						case core.Reject:
-							yd := core.YieldDetail{RefID: inv.ID, Output: "rejected by human: " + review.Reason, Failed: true}
-							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-							dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: yd.Output})
+							result := protocol.NewErrorResult(tc.ID, fmt.Errorf("rejected: %s", review.Reason))
+							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+							msgs = append(msgs, toolResultMsg(result))
 							continue
 						case core.Modify:
-							args = review.Modified
+							callToRun.Args = review.Modified
 						}
 					}
 				}
 			}
 
-			output, err := t.Perform(ctx, args)
-			failed := err != nil
-			if failed {
-				output = err.Error()
-			}
-			yd := core.YieldDetail{RefID: inv.ID, Output: output, Failed: failed}
-			emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-			dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: output})
-
-			if at, ok := t.(core.ArtifactTool); ok {
-				for _, art := range at.Artifacts() {
-					artCopy := art
-					emit(ch, core.Signal{Kind: core.SignalArtifact, Source: a.Name, Artifact: &artCopy})
-				}
-			}
+			result, _ := t.Run(ctx, callToRun)
+			emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+			msgs = append(msgs, toolResultMsg(result))
 		}
 	}
 

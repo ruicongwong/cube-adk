@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"cube-adk/pkg/brain"
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
 	"cube-adk/pkg/engine"
+	"cube-adk/pkg/protocol"
 	"cube-adk/pkg/runtime"
 	"cube-adk/pkg/tool"
 	"cube-adk/pkg/vault"
@@ -27,11 +29,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := brain.NewOAI(endpoint, secret, model)
+	m := brain.NewOpenAIModel(endpoint, secret, model)
 	mv := vault.NewMemVault()
 
-	// Calculator tool
-	calc := &core.QuickTool{
+	calc := &tool.QuickTool{
 		Name: "calculator",
 		Desc: "Evaluate a math expression. Input: JSON {\"expr\": \"2+3*4\"}",
 		Params: map[string]any{
@@ -54,8 +55,7 @@ func main() {
 		},
 	}
 
-	// Weather REST tool
-	weather := tool.NewRESTTool(core.RESTSpec{
+	weather := tool.NewRESTTool(tool.RESTSpec{
 		Name:       "get_weather",
 		Desc:       "Get current weather for a city. Input: JSON {\"city\": \"Beijing\"}",
 		Method:     "GET",
@@ -64,22 +64,21 @@ func main() {
 		ResultPath: "data.current",
 	})
 
-	// DuckDuckGo search tool
 	ddg := tool.NewDuckDuckGoTool()
 
 	agent := &engine.SoloAgent{
 		Name:    "assistant",
 		Persona: "You are a helpful assistant. Use tools when needed. Reply in the user's language.",
-		Brain:   b,
-		Tools:   []core.Tool{calc, weather, ddg},
+		Model:   m,
+		Tools:   []component.Tool{calc, weather, ddg},
 		Vault:   mv,
 	}
 
-	conv := runtime.NewConversation("demo", core.WithVault(mv))
-	conv.Append(core.Dialogue{Role: "user", Text: "马云"})
+	sess := runtime.NewSession("demo", core.WithVault(mv))
+	sess.Append(protocol.NewTextMessage("user", "马云"))
 
 	fmt.Println("=== Solo Agent Demo ===")
-	ch, err := agent.Execute(context.Background(), conv)
+	ch, err := agent.Execute(context.Background(), sess)
 	if err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
@@ -101,7 +100,7 @@ func printSignals(ch <-chan core.Signal) {
 			if sig.Yield.Failed {
 				status = "FAILED"
 			}
-			fmt.Printf(": [%s] %s", status, sig.Yield.Output)
+			fmt.Printf(": [%s] %s", status, sig.Yield.TextOf())
 		case core.SignalRecall:
 			fmt.Printf(": query=%q, %d fragments", sig.Recall.Query, len(sig.Recall.Fragments))
 		case core.SignalPlan:

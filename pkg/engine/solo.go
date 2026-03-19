@@ -6,42 +6,48 @@ import (
 	"fmt"
 	"strings"
 
+	"cube-adk/pkg/callback"
+	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
+	"cube-adk/pkg/option"
+	"cube-adk/pkg/protocol"
 )
 
 // SoloAgent implements a ReAct-style single agent with optional memory, gating, and tracing.
 type SoloAgent struct {
 	Name      string
 	Persona   string
-	Brain     core.Brain
-	Tools     []core.Tool
+	Model     component.Model
+	Tools     []component.Tool
 	Vault     core.Vault
 	StepLimit int
-	Gate      core.Gate   // optional HITL gate
-	Policy    core.Policy // optional gate policy
-	Tracer    core.Tracer // optional tracer
+	Gate      core.Gate
+	Policy    core.Policy
+	Tracer    core.Tracer
 
-	extraTools []core.Tool // injected by Conductor, not user-facing
+	extraTools []component.Tool // injected by Conductor
 }
 
-// InjectTools appends tools that are managed by the framework (e.g. handoff).
-// These are merged with user-configured Tools at execution time.
-func (a *SoloAgent) InjectTools(tools ...core.Tool) {
+// InjectTools appends tools managed by the framework (e.g. handoff).
+func (a *SoloAgent) InjectTools(tools ...component.Tool) {
 	a.extraTools = append(a.extraTools, tools...)
 }
 
 func (a *SoloAgent) Identity() string { return a.Name }
 
-func (a *SoloAgent) Execute(ctx context.Context, conv *core.Conversation) (<-chan core.Signal, error) {
+func (a *SoloAgent) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
 	ch := make(chan core.Signal, 16)
-	go a.run(ctx, conv, ch)
+	go a.run(ctx, sess, ch)
 	return ch, nil
 }
 
-func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal) {
+func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal) {
 	defer close(ch)
 
-	// Agent-level trace span
+	info := callback.RunInfo{Name: a.Name, Kind: "agent", Component: component.KindModel}
+	ctx = callback.OnStart(ctx, info, sess)
+	defer func() { callback.OnEnd(ctx, info, nil) }()
+
 	var span core.Span
 	if a.Tracer != nil {
 		ctx, span = a.Tracer.Start(ctx, "agent."+a.Name, core.SpanAgent)
@@ -54,29 +60,31 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 	}
 
 	allTools := append(a.Tools, a.extraTools...)
-	toolMap := make(map[string]core.Tool, len(allTools))
+	toolMap := make(map[string]component.Tool, len(allTools))
+	specs := make([]protocol.ToolSpec, 0, len(allTools))
 	for _, t := range allTools {
 		toolMap[t.Identity()] = t
+		specs = append(specs, t.Spec())
 	}
 
-	dialogue := a.buildDialogue(ctx, conv, ch)
+	msgs := a.buildMessages(ctx, sess, ch)
 
 	for step := 0; step < limit; step++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		resp, err := a.Brain.Think(ctx, dialogue, allTools)
+		resp, err := a.Model.Generate(ctx, msgs, option.WithToolSpecs(specs...))
 		if err != nil {
+			callback.OnError(ctx, info, err)
 			emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 			return
 		}
 
 		// No tool calls → final reply
-		if len(resp.Invocations) == 0 {
-			replyText := resp.Text
+		if len(resp.ToolCalls) == 0 {
+			replyText := resp.TextOf()
 
-			// Gate: review reply before emitting
 			if a.gateNeeded("reply") {
 				emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "reply"})
 				review, err := a.Gate.Check(ctx, core.Checkpoint{
@@ -85,8 +93,7 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 				if err == nil {
 					switch review.Verdict {
 					case core.Reject:
-						// Force another LLM round
-						dialogue = append(dialogue, core.Dialogue{Role: "user", Text: "Please try again. Reason: " + review.Reason})
+						msgs = append(msgs, protocol.NewTextMessage("user", "Please try again. Reason: "+review.Reason))
 						continue
 					case core.Modify:
 						replyText = review.Modified
@@ -95,7 +102,7 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 			}
 
 			emit(ch, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: replyText})
-			conv.Append(core.Dialogue{Role: "assistant", Text: replyText})
+			sess.Append(protocol.NewTextMessage("assistant", replyText))
 			if a.Vault != nil {
 				_ = a.Vault.Append(ctx, core.Entry{
 					Scope: core.ScopeWorking, Tag: "reply", Content: replyText,
@@ -104,32 +111,31 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 			return
 		}
 
-		if resp.Text != "" {
-			emit(ch, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: resp.Text})
+		if text := resp.TextOf(); text != "" {
+			emit(ch, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: text})
 		}
 
-		dialogue = append(dialogue, *resp)
+		msgs = append(msgs, resp)
 
-		for _, inv := range resp.Invocations {
+		for _, tc := range resp.ToolCalls {
 			emit(ch, core.Signal{
 				Kind: core.SignalInvoke, Source: a.Name,
-				Invoke: &core.InvokeDetail{ID: inv.ID, Name: inv.Name, Args: inv.Args},
+				Invoke: &protocol.ToolCall{ID: tc.ID, Kind: tc.Kind, Name: tc.Name, Args: tc.Args},
 			})
 
 			// Check for handoff
-			if inv.Name == "handoff" {
+			if tc.Name == "handoff" {
 				var hArgs struct{ Target string }
-				if err := json.Unmarshal([]byte(inv.Args), &hArgs); err == nil && hArgs.Target != "" {
-					// Gate: review handoff
+				if err := json.Unmarshal([]byte(tc.Args), &hArgs); err == nil && hArgs.Target != "" {
 					if a.gateNeeded("handoff") {
 						emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "handoff:" + hArgs.Target})
 						review, err := a.Gate.Check(ctx, core.Checkpoint{
-							Agent: a.Name, Kind: "handoff", Tool: hArgs.Target, Input: inv.Args,
+							Agent: a.Name, Kind: "handoff", Tool: hArgs.Target, Input: tc.Args,
 						})
 						if err == nil && review.Verdict == core.Reject {
-							yd := core.YieldDetail{RefID: inv.ID, Output: "handoff rejected: " + review.Reason, Failed: true}
-							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-							dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: yd.Output})
+							result := protocol.NewErrorResult(tc.ID, fmt.Errorf("handoff rejected: %s", review.Reason))
+							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+							msgs = append(msgs, toolResultMsg(result))
 							continue
 						}
 					}
@@ -138,61 +144,44 @@ func (a *SoloAgent) run(ctx context.Context, conv *core.Conversation, ch chan<- 
 				}
 			}
 
-			t, ok := toolMap[inv.Name]
+			t, ok := toolMap[tc.Name]
 			if !ok {
-				yd := core.YieldDetail{RefID: inv.ID, Output: fmt.Sprintf("unknown tool: %s", inv.Name), Failed: true}
-				emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-				dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: yd.Output})
+				result := protocol.NewErrorResult(tc.ID, fmt.Errorf("unknown tool: %s", tc.Name))
+				emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+				msgs = append(msgs, toolResultMsg(result))
 				continue
 			}
 
-			// Gate: review tool call before execution
-			args := inv.Args
+			// Gate: review tool call
+			callToRun := tc
 			if a.gateNeeded("tool") {
-				cp := core.Checkpoint{Agent: a.Name, Kind: "tool", Tool: inv.Name, Input: args}
+				cp := core.Checkpoint{Agent: a.Name, Kind: "tool", Tool: tc.Name, Input: tc.Args}
 				if a.Policy.NeedsReview(cp) {
-					emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + inv.Name})
+					emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + tc.Name})
 					review, err := a.Gate.Check(ctx, cp)
 					if err == nil {
 						switch review.Verdict {
 						case core.Reject:
-							yd := core.YieldDetail{RefID: inv.ID, Output: "rejected by human: " + review.Reason, Failed: true}
-							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-							dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: yd.Output})
+							result := protocol.NewErrorResult(tc.ID, fmt.Errorf("rejected: %s", review.Reason))
+							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+							msgs = append(msgs, toolResultMsg(result))
 							continue
 						case core.Modify:
-							args = review.Modified
+							callToRun.Args = review.Modified
 						}
 					}
 				}
 			}
 
-			output, err := t.Perform(ctx, args)
-			failed := err != nil
-			if failed {
-				output = err.Error()
-			}
-			yd := core.YieldDetail{RefID: inv.ID, Output: output, Failed: failed}
-			emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &yd})
-			dialogue = append(dialogue, core.Dialogue{Role: "tool", InvokeRef: inv.ID, Text: output})
-
-			// Check for artifacts
-			if at, ok := t.(core.ArtifactTool); ok {
-				for _, art := range at.Artifacts() {
-					artCopy := art
-					if conv.Shelf() != nil {
-						_ = conv.Shelf().Store(ctx, artCopy)
-					}
-					emit(ch, core.Signal{Kind: core.SignalArtifact, Source: a.Name, Artifact: &artCopy})
-				}
-			}
+			result, _ := t.Run(ctx, callToRun)
+			emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+			msgs = append(msgs, toolResultMsg(result))
 		}
 	}
 
 	emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: "step limit reached"})
 }
 
-// gateNeeded returns true if gate and policy are configured and the kind matches.
 func (a *SoloAgent) gateNeeded(kind string) bool {
 	if a.Gate == nil || a.Policy == nil {
 		return false
@@ -200,15 +189,15 @@ func (a *SoloAgent) gateNeeded(kind string) bool {
 	return a.Policy.NeedsReview(core.Checkpoint{Kind: kind})
 }
 
-func (a *SoloAgent) buildDialogue(ctx context.Context, conv *core.Conversation, ch chan<- core.Signal) []core.Dialogue {
-	var dialogue []core.Dialogue
+func (a *SoloAgent) buildMessages(ctx context.Context, sess *core.Session, ch chan<- core.Signal) []*protocol.Message {
+	var msgs []*protocol.Message
 
 	if a.Persona != "" {
-		dialogue = append(dialogue, core.Dialogue{Role: "system", Text: a.Persona})
+		msgs = append(msgs, protocol.NewTextMessage("system", a.Persona))
 	}
 
 	if a.Vault != nil {
-		history := conv.History()
+		history := sess.History()
 		query := lastUserQuery(history)
 		if query != "" {
 			frags, err := a.Vault.Recall(ctx, query, 5)
@@ -218,7 +207,7 @@ func (a *SoloAgent) buildDialogue(ctx context.Context, conv *core.Conversation, 
 					parts = append(parts, f.Content)
 				}
 				recallText := "Recalled from memory:\n" + strings.Join(parts, "\n---\n")
-				dialogue = append(dialogue, core.Dialogue{Role: "system", Text: recallText})
+				msgs = append(msgs, protocol.NewTextMessage("system", recallText))
 				emit(ch, core.Signal{
 					Kind: core.SignalRecall, Source: a.Name,
 					Recall: &core.RecallDetail{Query: query, Fragments: frags},
@@ -227,14 +216,14 @@ func (a *SoloAgent) buildDialogue(ctx context.Context, conv *core.Conversation, 
 		}
 	}
 
-	dialogue = append(dialogue, conv.History()...)
-	return dialogue
+	msgs = append(msgs, sess.History()...)
+	return msgs
 }
 
-func lastUserQuery(history []core.Dialogue) string {
+func lastUserQuery(history []*protocol.Message) string {
 	for i := len(history) - 1; i >= 0; i-- {
 		if history[i].Role == "user" {
-			return history[i].Text
+			return history[i].TextOf()
 		}
 	}
 	return ""
@@ -242,4 +231,13 @@ func lastUserQuery(history []core.Dialogue) string {
 
 func emit(ch chan<- core.Signal, s core.Signal) {
 	ch <- s
+}
+
+// toolResultMsg creates a tool-role message from a ToolResult.
+func toolResultMsg(r protocol.ToolResult) *protocol.Message {
+	return &protocol.Message{
+		Role:       "tool",
+		ToolCallID: r.CallID,
+		Content:    r.Content,
+	}
 }
