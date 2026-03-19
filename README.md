@@ -1,25 +1,35 @@
 # Cube ADK
 
-Cube ADK 是一个用 Go 编写的 Agent 开发框架，用于构建基于 LLM 的智能体系统。支持单 Agent、多 Agent 编排、工具调用、记忆管理、人机审批、可观测性追踪等能力。
+Cube ADK 是一个用 Go 编写的 Agent 开发框架，用于构建基于 LLM 的智能体系统。采用分层架构设计，提供完整的协议层、组件层、回调系统，支持多模态、流式推理、动态选项、多 Agent 编排、工具调用、记忆管理、人机审批、可观测性追踪等能力。
 
 ## 架构总览
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                   Examples                           │
-│           solo  /  team  /  artifact                 │
-├──────────────────────────────────────────────────────┤
-│                 Engine（Agent 实现）                  │
-│    SoloAgent / ChainAgent / DeepAgent / Conductor    │
-├──────────────────────────────────────────────────────┤
-│                 Core（接口定义）                      │
-│  Agent · Brain · Tool · Vault · Shelf                │
-│  Bus · Gate · Policy · Tracer                        │
-├──────────────────────────────────────────────────────┤
-│                 Implementations                      │
-│  OAI Brain · REST/DDG Tools · Mem/File Vault/Shelf   │
-│  MemBus · CLI/Callback Gate · MemTracer              │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      Examples                            │
+│            solo  /  team  /  artifact                    │
+├──────────────────────────────────────────────────────────┤
+│                Engine（Agent 实现）                       │
+│  SoloAgent / ChainAgent / DeepAgent / Conductor          │
+│  ParallelAgent                                           │
+├──────────────────────────────────────────────────────────┤
+│                 Core（核心类型）                           │
+│  Agent · Session · Signal · Vault · Shelf                │
+│  Bus · Gate · Policy · Tracer                            │
+├──────────────────────────────────────────────────────────┤
+│              Callback（生命周期回调）                      │
+│  Handler · RunInfo · TimingGuard · Inject/Extract        │
+├──────────────────────────────────────────────────────────┤
+│              Component（组件接口）                         │
+│  Model · Tool · Retriever · Embedder                     │
+├──────────────────────────────────────────────────────────┤
+│              Option（两层函数式选项）                      │
+│  ModelOption · ToolOption · RetrieverOption               │
+├──────────────────────────────────────────────────────────┤
+│              Protocol（协议层）                            │
+│  Message · ContentPart · ToolCall · ToolSpec · ToolResult │
+│  StreamReader · StreamWriter · Document                   │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## 快速开始
@@ -40,174 +50,239 @@ import (
     "cube-adk/pkg/brain"
     "cube-adk/pkg/core"
     "cube-adk/pkg/engine"
+    "cube-adk/pkg/protocol"
     "cube-adk/pkg/runtime"
 )
 
 func main() {
-    b := &brain.OAI{
-        Endpoint: "https://api.openai.com/v1",
-        Secret:   "sk-xxx",
-        ModelID:  "gpt-4o",
-    }
+    m := brain.NewOpenAIModel(
+        "https://api.openai.com/v1",
+        "sk-xxx",
+        "gpt-4o",
+    )
 
     agent := &engine.SoloAgent{
         Name:    "assistant",
         Persona: "你是一个有帮助的助手。",
-        Brain:   b,
+        Model:   m,
     }
 
-    conv := runtime.NewConversation()
-    conv.Append(core.Dialogue{Role: "user", Text: "你好"})
+    sess := runtime.NewSession("demo")
+    sess.Append(protocol.NewTextMessage("user", "你好"))
 
-    for sig := range agent.Execute(context.Background(), conv) {
-        if sig.Kind == core.SigReply {
+    ch, _ := agent.Execute(context.Background(), sess)
+    for sig := range ch {
+        if sig.Kind == core.SignalReply {
             fmt.Println(sig.Text)
         }
     }
 }
 ```
 
-## 核心接口（pkg/core）
+## 协议层（pkg/protocol）
 
-所有组件面向接口编程，可自由替换实现。
+协议层定义了框架中所有共享的数据类型，支持多模态内容。
+
+### Message — 多模态消息
+
+```go
+msg := protocol.NewTextMessage("user", "描述这张图片")
+
+// 多模态消息
+msg := protocol.NewUserParts(
+    protocol.ContentPart{Kind: protocol.PartText, Text: "这是什么？"},
+    protocol.ContentPart{Kind: protocol.PartImage, PartMeta: protocol.PartMeta{URL: "https://example.com/img.png"}},
+)
+
+// 提取纯文本
+text := msg.TextOf()
+```
+
+支持的内容类型：`PartText`、`PartImage`、`PartAudio`、`PartVideo`、`PartFile`、`PartReasoning`。
+
+### ToolCall / ToolSpec / ToolResult — 工具调用协议
+
+```go
+// 工具规格（供 LLM 理解）
+spec := protocol.ToolSpec{
+    Name:   "calculator",
+    Desc:   "计算数学表达式",
+    Schema: map[string]any{"type": "object", "properties": map[string]any{...}},
+}
+
+// 工具调用结果
+result := protocol.NewTextResult(callID, "42")
+errResult := protocol.NewErrorResult(callID, err)
+```
+
+### StreamReader / StreamWriter — 泛型流式读取
+
+```go
+reader, writer := protocol.Pipe[*protocol.Message](8)
+
+// 生产端
+go func() {
+    writer.Send(msg)
+    writer.Finish(nil)
+}()
+
+// 消费端
+for {
+    msg, err := reader.Recv()
+    if err != nil { break }
+    fmt.Println(msg.TextOf())
+}
+
+// 工具函数
+items, _ := protocol.CollectAll(reader)
+mapped := protocol.MapReader(reader, transformFn)
+copies := reader.Copy(3) // 扇出
+```
+
+## 组件接口（pkg/component）
+
+### Model — LLM 推理
+
+```go
+type Model interface {
+    Generate(ctx context.Context, msgs []*protocol.Message, opts ...option.ModelOption) (*protocol.Message, error)
+    Stream(ctx context.Context, msgs []*protocol.Message, opts ...option.ModelOption) (*protocol.StreamReader[*protocol.Message], error)
+}
+```
+
+Tool 绑定在 Agent 层，通过 `option.WithToolSpecs()` 传给 Model。
+
+### Tool — 结构化工具
+
+```go
+type Tool interface {
+    Identity() string
+    Brief() string
+    Spec() protocol.ToolSpec
+    Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error)
+}
+```
+
+快捷创建：
+
+```go
+calc := &tool.QuickTool{
+    Name: "calculator",
+    Desc: "计算数学表达式",
+    Params: map[string]any{...},
+    Fn: func(ctx context.Context, args string) (string, error) {
+        return result, nil
+    },
+}
+```
+
+### Retriever / Embedder — RAG 组件
+
+```go
+type Retriever interface {
+    Retrieve(ctx context.Context, query string, opts ...option.RetrieverOption) ([]*protocol.Document, error)
+}
+
+type Embedder interface {
+    Embed(ctx context.Context, texts []string) ([][]float64, error)
+}
+```
+
+## 两层函数式选项（pkg/option）
+
+支持通用选项和实现特定选项在同一变参中混用：
+
+```go
+// 通用选项
+resp, _ := model.Generate(ctx, msgs,
+    option.WithTemperature(0.7),
+    option.WithMaxTokens(1024),
+    option.WithToolSpecs(specs...),
+)
+
+// vLLM 特有选项（通过 impl-specific 层传递）
+resp, _ := model.Generate(ctx, msgs,
+    option.WithTemperature(0.7),
+    brain.WithGuidedJSON(schema),    // vLLM guided decoding
+    brain.WithRepetitionPenalty(1.1),
+)
+```
+
+## 回调系统（pkg/callback）
+
+AOP 风格的生命周期钩子，通过 context 注入，无 handler 时零开销。
+
+```go
+// 构建 handler
+handler := callback.NewHandler().
+    Start(func(ctx context.Context, info callback.RunInfo, input any) context.Context {
+        fmt.Printf("[%s] started\n", info.Name)
+        return ctx
+    }).
+    End(func(ctx context.Context, info callback.RunInfo, output any) context.Context {
+        fmt.Printf("[%s] finished\n", info.Name)
+        return ctx
+    }).
+    Error(func(ctx context.Context, info callback.RunInfo, err error) context.Context {
+        fmt.Printf("[%s] error: %v\n", info.Name, err)
+        return ctx
+    }).
+    Build()
+
+// 注入到 context
+ctx = callback.Inject(ctx, handler)
+
+// Agent 内部自动分发 OnStart/OnEnd/OnError
+// TimingGuard 确保无 handler 时零开销
+```
+
+## 核心类型（pkg/core）
 
 ### Agent
 
 ```go
 type Agent interface {
     Identity() string
-    Execute(ctx context.Context, conv *Conversation) <-chan Signal
+    Execute(ctx context.Context, sess *Session) (<-chan Signal, error)
 }
 ```
 
-Agent 通过 channel 返回 `Signal` 事件流（Think / Invoke / Yield / Reply / Handoff / Fault 等），调用方可实时消费。
+Agent 通过 channel 返回 `Signal` 事件流（Think / Invoke / Yield / Reply / Handoff / Fault / Recall / Plan / Synth / Artifact / Gate），调用方可实时消费。
 
-### Brain
+### Session
+
+替代旧的 Conversation，基于 `protocol.Message`：
 
 ```go
-type Brain interface {
-    Think(ctx context.Context, dialogue []Dialogue, tools []Tool) (*Dialogue, error)
-}
+sess := core.NewSession("demo", core.WithVault(mv), core.WithShelf(sh))
+sess.Append(protocol.NewTextMessage("user", "你好"))
+history := sess.History() // []*protocol.Message
+sess.Set("key", value)
 ```
 
-LLM 推理抽象。输入对话历史和可用工具，返回 assistant 消息（可能包含工具调用请求）。返回的 `Dialogue` 携带 `Usage`（token 用量）和 `TTFT`（首 token 耗时）。
+### Vault / Shelf / Bus / Gate / Tracer
 
-### Tool
-
-```go
-type Tool interface {
-    Identity() string
-    Brief() string
-    Schema() map[string]any
-    Perform(ctx context.Context, input string) (string, error)
-}
-```
-
-工具能力抽象。`Schema()` 返回 JSON Schema 供 LLM 理解参数格式。实现 `ArtifactTool` 接口的工具还可以产出富媒体产物。
-
-快捷创建方式：
-
-```go
-calc := &core.QuickTool{
-    Name: "calculator",
-    Desc: "计算数学表达式",
-    Params: map[string]any{
-        "type": "object",
-        "properties": map[string]any{
-            "expression": map[string]any{"type": "string"},
-        },
-    },
-    Fn: func(ctx context.Context, input string) (string, error) {
-        // 解析并计算 expression
-        return result, nil
-    },
-}
-```
-
-### Vault（记忆系统）
-
-```go
-type Vault interface {
-    Append(ctx context.Context, entry Entry) error
-    Recall(ctx context.Context, query string, limit int) ([]Fragment, error)
-    Forget(ctx context.Context, filter Filter) error
-}
-```
-
-三级记忆作用域：`Working`（工作记忆）、`Short`（短期）、`Long`（长期）。Agent 每轮推理前会自动 Recall 相关记忆注入上下文。
-
-### Shelf（产物存储）
-
-```go
-type Shelf interface {
-    Store(ctx context.Context, artifact ArtifactDetail) error
-    Fetch(ctx context.Context, id string) (*ArtifactDetail, error)
-    List(ctx context.Context, mime string, limit int) ([]ArtifactDetail, error)
-    Discard(ctx context.Context, id string) error
-}
-```
-
-存储 Agent 产出的富媒体内容（HTML、图片、JSON 等）。
-
-### Gate & Policy（人机审批）
-
-```go
-type Gate interface {
-    Check(ctx context.Context, cp Checkpoint) (*Review, error)
-}
-
-type Policy interface {
-    NeedsReview(cp Checkpoint) bool
-}
-```
-
-Gate 负责获取人类审批结果（批准 / 拒绝 / 修改），Policy 决定哪些操作需要审批。
-
-### Bus（消息总线）
-
-```go
-type Bus interface {
-    Publish(ctx context.Context, topic string, sig Signal) error
-    Subscribe(topic string) (<-chan Signal, error)
-    Close() error
-}
-```
-
-Agent 间的发布/订阅通信机制。
-
-### Tracer（可观测性）
-
-```go
-type Tracer interface {
-    Start(ctx context.Context, name string, kind SpanKind) (context.Context, Span)
-}
-```
-
-分布式追踪抽象，支持 Agent / Brain / Tool 三种 SpanKind。Span 自动记录 token 用量、TTFT、耗时等指标。
+接口定义与之前一致，详见 `pkg/core/` 下各文件。
 
 ## Agent 引擎（pkg/engine）
 
 ### SoloAgent — 单 Agent ReAct 循环
 
-最常用的 Agent 类型。执行 Think → Invoke → Yield → Reply 循环，直到 LLM 给出最终回复或达到步数上限。
-
 ```go
 agent := &engine.SoloAgent{
     Name:      "researcher",
     Persona:   "你是一个研究助手。",
-    Brain:     oaiBrain,
-    Tools:     []core.Tool{searchTool, calcTool},
-    Vault:     memVault,       // 可选：记忆
-    StepLimit: 10,             // 可选：最大循环步数
-    Gate:      cliGate,        // 可选：人机审批
-    Policy:    toolPolicy,     // 可选：审批策略
-    Tracer:    memTracer,      // 可选：追踪
+    Model:     model,
+    Tools:     []component.Tool{searchTool, calcTool},
+    Vault:     memVault,
+    StepLimit: 10,
+    Gate:      cliGate,
+    Policy:    toolPolicy,
+    Tracer:    memTracer,
 }
 ```
 
 ### ChainAgent — 顺序编排
-
-将多个 Agent 串联执行，前一个 Agent 的回复作为下一个的用户输入。
 
 ```go
 chain := &engine.ChainAgent{
@@ -218,199 +293,101 @@ chain := &engine.ChainAgent{
 
 ### DeepAgent — 递归分解
 
-对复杂任务进行 Plan → Execute → Synthesize 递归分解。LLM 先将任务拆分为子任务，递归执行后综合结果。
-
 ```go
 deep := &engine.DeepAgent{
     Name:     "analyst",
     Persona:  "你是一个深度分析师。",
-    Brain:    oaiBrain,
+    Model:    model,
     Tools:    tools,
-    MaxDepth: 3,       // 最大递归深度
+    MaxDepth: 3,
 }
 ```
 
 ### Conductor — 多 Agent 调度
 
-管理多个 Agent，支持 Handoff（移交）机制。Agent 可以通过返回 `SigHandoff` 信号将对话移交给其他 Agent。
+自动为子 Agent 注入 handoff 工具，支持 Agent 间移交对话：
 
 ```go
-conductor := &engine.Conductor{
-    Name:       "orchestrator",
-    Agents:     map[string]core.Agent{"researcher": r, "writer": w},
-    EntryAgent: "researcher",
-}
+conductor := engine.NewConductor("team", "researcher", researcher, writer)
 ```
 
-也可以将 Agent 包装为 Tool 供其他 Agent 调用：
+将 Agent 包装为 Tool：
 
 ```go
-delegateTool := conductor.AsTool("writer", "让写作 Agent 撰写内容")
+delegateTool := engine.AsTool(writer)
+```
+
+### ParallelAgent — 并发执行
+
+多个 Agent 并发执行，结果合并：
+
+```go
+parallel := &engine.ParallelAgent{
+    Name:   "multi-search",
+    Agents: []core.Agent{agent1, agent2, agent3},
+    Merge: func(results map[string][]core.Signal) string {
+        // 自定义合并逻辑，nil 时默认拼接所有 Reply
+        return merged
+    },
+}
 ```
 
 ## 内置实现
 
-### Brain — OAI（pkg/brain）
+### Model — OpenAIModel（pkg/brain）
 
-兼容 OpenAI Chat Completions API 的 Brain 实现，支持任意兼容端点（OpenAI、Azure、本地模型等）。
+兼容 OpenAI / vLLM / 任意兼容端点，支持多模态消息和 SSE 流式推理：
 
 ```go
-b := &brain.OAI{
-    Endpoint:   "https://api.openai.com/v1",
-    Secret:     "sk-xxx",
-    ModelID:    "gpt-4o",
-    HTTPClient: http.DefaultClient, // 可选：自定义 HTTP 客户端
-}
-```
+// OpenAI
+m := brain.NewOpenAIModel("https://api.openai.com/v1", "sk-xxx", "gpt-4o")
 
-自动解析 API 返回的 `usage` 字段，填充 `Dialogue.Usage` 和 `Dialogue.TTFT`。
+// vLLM（通常无需 API Key）
+m := brain.NewVLLMModel("http://localhost:8000/v1", "Qwen/Qwen2-7B")
+```
 
 ### Tools（pkg/tool）
 
-**DuckDuckGo 搜索** — 无需 API Key 的网页搜索：
-
 ```go
-ddg := &tool.DuckDuckGoTool{}
-```
+// DuckDuckGo 搜索
+ddg := tool.NewDuckDuckGoTool()
 
-**REST 工具** — 声明式 REST API 封装：
-
-```go
-weather := core.RESTSpec{
+// 声明式 REST API 封装
+weather := tool.NewRESTTool(tool.RESTSpec{
     Name:       "get_weather",
     Desc:       "查询天气",
     Method:     "GET",
     URL:        "https://api.weather.com/v1/{city}",
     Headers:    map[string]string{"Authorization": "Bearer xxx"},
     ResultPath: "current.temperature",
-}
-weatherTool := tool.FromREST(weather)
+})
 ```
 
-### Vault 实现（pkg/vault）
-
-| 实现 | 说明 |
-|---|---|
-| `MemVault` | 内存存储，适合开发测试 |
-| `FileVault` | 文件持久化，按 working/short/long 目录分类存储 JSON |
+### Trace（pkg/trace）
 
 ```go
-mv := vault.NewMemVault()
-fv, _ := vault.NewFileVault("/path/to/memory")
-```
-
-### Shelf 实现（pkg/shelf）
-
-| 实现 | 说明 |
-|---|---|
-| `MemShelf` | 内存存储 |
-| `FileShelf` | 文件持久化，每个 artifact 存为 .meta.json + .data |
-
-```go
-ms := shelf.NewMemShelf()
-fs, _ := shelf.NewFileShelf("/path/to/artifacts")
-```
-
-### Gate 实现（pkg/gate）
-
-| 实现 | 说明 |
-|---|---|
-| `CLIGate` | 命令行交互审批 |
-| `CallbackGate` | 自定义回调函数 |
-| `ChannelGate` | 基于 channel，适合集成 Web/Slack |
-
-```go
-// CLI 审批
-g := &gate.CLIGate{}
-
-// 自定义回调
-g := &gate.CallbackGate{Fn: func(ctx context.Context, cp core.Checkpoint) (*core.Review, error) {
-    return &core.Review{Verdict: core.Approve}, nil
-}}
-
-// Channel 审批（适合 Web 集成）
-g := gate.NewChannelGate()
-go func() {
-    for cp := range g.Pending() {
-        g.Respond() <- &core.Review{Verdict: core.Approve}
-    }
-}()
-```
-
-### Policy 实现（pkg/gate）
-
-```go
-gate.AllowAll{}                           // 全部放行
-gate.ToolPolicy{Names: []string{"rm"}}    // 仅审批指定工具
-gate.KindPolicy{Kinds: []string{"tool"}}  // 按类型审批
-gate.CompositePolicy{Policies: [...]}     // 组合策略（OR 逻辑）
-```
-
-### Bus 实现（pkg/bus）
-
-```go
-b := bus.NewMemBus()
-ch, _ := b.Subscribe("events")
-b.Publish(ctx, "events", signal)
-```
-
-### Trace 实现（pkg/trace）
-
-```go
-// 内存追踪（开发调试）
 t := trace.NewMemTracer()
 
-// 无操作追踪（生产环境关闭追踪）
-t := trace.Nop
-
-// 包装 Brain/Tool 自动注入追踪
-brain := trace.WrapBrain(oaiBrain, t)
+// 包装 Model/Tool 自动注入追踪
+model := trace.WrapModel(rawModel, t)
 tools := trace.WrapTools(rawTools, t)
 
 // 查看追踪结果
 for _, sp := range t.Spans() {
     fmt.Printf("%s %s %v\n", sp.Name, sp.Duration(), sp.TokenUsage())
 }
-
-// 聚合统计
 summary := t.Summary()
-fmt.Printf("总耗时: %v, Brain调用: %d, Token: %d\n",
-    summary.TotalDuration, summary.BrainCalls, summary.TotalTokens)
-```
-
-## Runtime 工具（pkg/runtime）
-
-Signal 流处理工具函数：
-
-```go
-// 收集所有信号
-signals := runtime.Collect(agent.Execute(ctx, conv))
-
-// 旁路监听
-ch := runtime.Tap(agent.Execute(ctx, conv), func(sig core.Signal) {
-    log.Println(sig.Kind, sig.Text)
-})
-
-// 按类型过滤
-replies := runtime.FilterKind(signals, core.SigReply)
-
-// 提取产物
-artifacts := runtime.CollectArtifacts(signals)
 ```
 
 ## 示例
-
-项目包含三个完整示例：
 
 - `examples/solo/` — 单 Agent + 工具调用（计算器、天气、搜索）
 - `examples/team/` — 多 Agent 编排（Chain、Conductor、DeepAgent）
 - `examples/artifact/` — 产物生成与存储
 
-运行示例：
-
 ```bash
-export OAI_KEY=sk-xxx
-export OAI_ENDPOINT=https://api.openai.com/v1
+export OPENAI_API_KEY=sk-xxx
+export OPENAI_ENDPOINT=https://api.openai.com/v1
 go run examples/solo/main.go
 ```
 
