@@ -3,8 +3,6 @@ package engine
 import (
 	"context"
 
-	"cube-adk/pkg/callback"
-	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
 	"cube-adk/pkg/protocol"
 )
@@ -18,24 +16,17 @@ type ChainAgent struct {
 
 func (c *ChainAgent) Identity() string { return c.Name }
 
-func (c *ChainAgent) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
-	ch := make(chan core.Signal, 16)
-	go c.run(ctx, sess, ch)
-	return ch, nil
+func (c *ChainAgent) Execute(ctx context.Context, state *core.State) (*protocol.StreamReader[core.Signal], error) {
+	r, w := protocol.Pipe[core.Signal](16)
+	go c.run(ctx, state, w)
+	return r, nil
 }
 
-func (c *ChainAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal) {
-	defer close(ch)
+func (c *ChainAgent) run(ctx context.Context, sess *core.State, w *protocol.StreamWriter[core.Signal]) {
+	defer w.Finish(nil)
 
-	info := callback.RunInfo{Name: c.Name, Kind: "agent", Component: component.KindModel}
-	ctx = callback.OnStart(ctx, info, sess)
-	defer func() { callback.OnEnd(ctx, info, nil) }()
-
-	var span core.Span
-	if c.Tracer != nil {
-		ctx, span = c.Tracer.Start(ctx, "agent.chain."+c.Name, core.SpanAgent)
-		defer span.End(nil)
-	}
+	ctx, hooks := beginHooks(ctx, c.Tracer, c.Name, "agent.chain."+c.Name, core.SpanAgent, sess)
+	defer hooks.End(ctx, nil)
 
 	for _, agent := range c.Agents {
 		if ctx.Err() != nil {
@@ -44,13 +35,17 @@ func (c *ChainAgent) run(ctx context.Context, sess *core.Session, ch chan<- core
 
 		sub, err := agent.Execute(ctx, sess)
 		if err != nil {
-			ch <- core.Signal{Kind: core.SignalFault, Source: c.Name, Text: err.Error()}
+			_ = w.Send(core.Signal{Kind: core.SignalFault, Source: c.Name, Text: err.Error()})
 			return
 		}
 
 		var lastReply string
-		for s := range sub {
-			ch <- s
+		for {
+			s, err := sub.Recv()
+			if err != nil {
+				break
+			}
+			_ = w.Send(s)
 			if s.Kind == core.SignalReply {
 				lastReply = s.Text
 			}

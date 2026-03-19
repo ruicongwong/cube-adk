@@ -79,7 +79,7 @@ func main() {
 		Vault:   mv,
 	}
 
-	sess := runtime.NewSession("artifact-demo", core.WithVault(mv), core.WithShelf(sh))
+	sess := runtime.NewState("artifact-demo", core.WithVault(mv), core.WithShelf(sh))
 	sess.Append(protocol.NewTextMessage("user", "Write a brief report about the benefits of AI in healthcare"))
 
 	fmt.Println("=== Artifact Demo ===")
@@ -89,7 +89,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	for sig := range ch {
+	for {
+		sig, err := ch.Recv()
+		if err != nil {
+			break
+		}
 		fmt.Printf("[%s] %s", sig.Kind, sig.Source)
 		switch sig.Kind {
 		case core.SignalThink, core.SignalReply, core.SignalFault:

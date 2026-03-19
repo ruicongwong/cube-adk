@@ -36,16 +36,17 @@ type restTool struct {
 	schema map[string]any
 	tpl    *template.Template
 	client *http.Client
+	opts   []option.ToolOption
 }
 
 // NewRESTTool creates a Tool from a RESTSpec declaration.
-func NewRESTTool(spec RESTSpec) *restTool {
-	return NewRESTToolWithClient(spec, &http.Client{})
+func NewRESTTool(spec RESTSpec, opts ...option.ToolOption) *restTool {
+	return NewRESTToolWithClient(spec, &http.Client{}, opts...)
 }
 
 // NewRESTToolWithClient creates a RESTTool with a custom http.Client.
-func NewRESTToolWithClient(spec RESTSpec, client *http.Client) *restTool {
-	t := &restTool{spec: spec, client: client}
+func NewRESTToolWithClient(spec RESTSpec, client *http.Client, opts ...option.ToolOption) *restTool {
+	t := &restTool{spec: spec, client: client, opts: opts}
 	t.schema = t.buildSchema()
 	if spec.BodyTpl != "" {
 		t.tpl, _ = template.New("body").Parse(spec.BodyTpl)
@@ -82,16 +83,32 @@ func (t *restTool) buildSchema() map[string]any {
 }
 
 func (t *restTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
+	all := append(t.opts, opts...)
+	ctx, cleanup, attempts := applyToolOpts(ctx, all...)
+	defer cleanup()
+
+	var lastResult protocol.ToolResult
+	for i := range attempts {
+		result, retry := t.doRun(ctx, call)
+		if !retry || i+1 >= attempts {
+			return result, nil
+		}
+		lastResult = result
+	}
+	return lastResult, nil
+}
+
+func (t *restTool) doRun(ctx context.Context, call protocol.ToolCall) (protocol.ToolResult, bool) {
 	var args map[string]string
 	if err := json.Unmarshal([]byte(call.Args), &args); err != nil {
-		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: parse args: %w", err)), nil
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: parse args: %w", err)), false
 	}
 
 	url := t.spec.URL
 	for _, m := range pathParamRe.FindAllStringSubmatch(url, -1) {
 		val, ok := args[m[1]]
 		if !ok {
-			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: missing path param %q", m[1])), nil
+			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: missing path param %q", m[1])), false
 		}
 		url = strings.Replace(url, m[0], val, 1)
 	}
@@ -111,14 +128,14 @@ func (t *restTool) Run(ctx context.Context, call protocol.ToolCall, opts ...opti
 	if t.tpl != nil {
 		var buf bytes.Buffer
 		if err := t.tpl.Execute(&buf, args); err != nil {
-			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: render body: %w", err)), nil
+			return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: render body: %w", err)), false
 		}
 		bodyReader = &buf
 	}
 
 	req, err := http.NewRequestWithContext(ctx, t.spec.Method, url, bodyReader)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, err), nil
+		return protocol.NewErrorResult(call.ID, err), true
 	}
 	for k, v := range t.spec.Headers {
 		req.Header.Set(k, v)
@@ -129,20 +146,20 @@ func (t *restTool) Run(ctx context.Context, call protocol.ToolCall, opts ...opti
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: http: %w", err)), nil
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: http: %w", err)), true
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: read: %w", err)), nil
+		return protocol.NewErrorResult(call.ID, fmt.Errorf("resttool: read: %w", err)), true
 	}
 
 	output := string(data)
 	if t.spec.ResultPath != "" {
 		output, _ = extractPath(data, t.spec.ResultPath)
 	}
-	return protocol.NewTextResult(call.ID, output), nil
+	return protocol.NewTextResult(call.ID, output), false
 }
 
 func extractPath(data []byte, path string) (string, error) {

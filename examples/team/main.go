@@ -54,7 +54,7 @@ func main() {
 		Agents: []core.Agent{researcher, writer},
 	}
 
-	sess := runtime.NewSession("team-demo", core.WithVault(mv))
+	sess := runtime.NewState("team-demo", core.WithVault(mv))
 	sess.Append(protocol.NewTextMessage("user", "Write an article about the latest AI developments"))
 
 	ch, err := chain.Execute(context.Background(), sess)
@@ -77,7 +77,7 @@ func main() {
 
 	conductor := engine.NewConductor("team", "researcher", researcherWithHandoff, writer)
 
-	sess2 := runtime.NewSession("conductor-demo", core.WithVault(mv))
+	sess2 := runtime.NewState("conductor-demo", core.WithVault(mv))
 	sess2.Append(protocol.NewTextMessage("user", "Research and write about quantum computing breakthroughs"))
 
 	ch2, err := conductor.Execute(context.Background(), sess2)
@@ -99,7 +99,7 @@ func main() {
 		MaxDepth: 2,
 	}
 
-	sess3 := runtime.NewSession("deep-demo", core.WithVault(mv))
+	sess3 := runtime.NewState("deep-demo", core.WithVault(mv))
 	sess3.Append(protocol.NewTextMessage("user", "Compare the AI strategies of major tech companies in 2025"))
 
 	ch3, err := deep.Execute(context.Background(), sess3)
@@ -110,8 +110,12 @@ func main() {
 	printSignals(ch3)
 }
 
-func printSignals(ch <-chan core.Signal) {
-	for sig := range ch {
+func printSignals(r *protocol.StreamReader[core.Signal]) {
+	for {
+		sig, err := r.Recv()
+		if err != nil {
+			break
+		}
 		fmt.Printf("[%s] %s", sig.Kind, sig.Source)
 		switch sig.Kind {
 		case core.SignalThink, core.SignalReply, core.SignalFault:

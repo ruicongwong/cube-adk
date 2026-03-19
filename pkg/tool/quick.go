@@ -13,6 +13,7 @@ type QuickTool struct {
 	Desc   string
 	Params map[string]any
 	Fn     func(ctx context.Context, args string) (string, error)
+	Opts   []option.ToolOption // default options applied on every Run
 }
 
 func (t *QuickTool) Identity() string { return t.Name }
@@ -27,9 +28,17 @@ func (t *QuickTool) Spec() protocol.ToolSpec {
 }
 
 func (t *QuickTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
-	output, err := t.Fn(ctx, call.Args)
-	if err != nil {
-		return protocol.NewErrorResult(call.ID, err), nil
+	all := append(t.Opts, opts...)
+	ctx, cleanup, attempt := applyToolOpts(ctx, all...)
+	defer cleanup()
+	var result protocol.ToolResult
+	for i := 0; i < attempt; i++ {
+		output, err := t.Fn(ctx, call.Args)
+		if err != nil {
+			result = protocol.NewErrorResult(call.ID, err)
+			continue
+		}
+		return protocol.NewTextResult(call.ID, output), nil
 	}
-	return protocol.NewTextResult(call.ID, output), nil
+	return result, nil
 }

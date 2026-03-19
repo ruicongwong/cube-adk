@@ -3,7 +3,7 @@ package runtime
 
 import "cube-adk/pkg/core"
 
-// NewSession is a convenience re-export of core.NewSession.
-func NewSession(id string, opts ...core.SessionOption) *core.Session {
-	return core.NewSession(id, opts...)
+// NewState is a convenience re-export of core.NewState.
+func NewState(id string, opts ...core.StateOption) *core.State {
+	return core.NewState(id, opts...)
 }

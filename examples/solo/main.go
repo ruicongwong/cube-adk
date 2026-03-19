@@ -74,7 +74,7 @@ func main() {
 		Vault:   mv,
 	}
 
-	sess := runtime.NewSession("demo", core.WithVault(mv))
+	sess := runtime.NewState("demo", core.WithVault(mv))
 	sess.Append(protocol.NewTextMessage("user", "马云"))
 
 	fmt.Println("=== Solo Agent Demo ===")
@@ -87,8 +87,12 @@ func main() {
 	printSignals(ch)
 }
 
-func printSignals(ch <-chan core.Signal) {
-	for sig := range ch {
+func printSignals(r *protocol.StreamReader[core.Signal]) {
+	for {
+		sig, err := r.Recv()
+		if err != nil {
+			break
+		}
 		fmt.Printf("[%s] %s", sig.Kind, sig.Source)
 		switch sig.Kind {
 		case core.SignalThink, core.SignalReply, core.SignalFault:

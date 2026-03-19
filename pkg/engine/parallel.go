@@ -5,9 +5,8 @@ import (
 	"strings"
 	"sync"
 
-	"cube-adk/pkg/callback"
-	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
+	"cube-adk/pkg/protocol"
 )
 
 // ParallelAgent executes multiple agents concurrently and merges their results.
@@ -20,24 +19,17 @@ type ParallelAgent struct {
 
 func (p *ParallelAgent) Identity() string { return p.Name }
 
-func (p *ParallelAgent) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
-	ch := make(chan core.Signal, 16)
-	go p.run(ctx, sess, ch)
-	return ch, nil
+func (p *ParallelAgent) Execute(ctx context.Context, state *core.State) (*protocol.StreamReader[core.Signal], error) {
+	r, w := protocol.Pipe[core.Signal](16)
+	go p.run(ctx, state, w)
+	return r, nil
 }
 
-func (p *ParallelAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal) {
-	defer close(ch)
+func (p *ParallelAgent) run(ctx context.Context, sess *core.State, w *protocol.StreamWriter[core.Signal]) {
+	defer w.Finish(nil)
 
-	info := callback.RunInfo{Name: p.Name, Kind: "agent", Component: component.KindModel}
-	ctx = callback.OnStart(ctx, info, sess)
-	defer func() { callback.OnEnd(ctx, info, nil) }()
-
-	var span core.Span
-	if p.Tracer != nil {
-		ctx, span = p.Tracer.Start(ctx, "agent.parallel."+p.Name, core.SpanAgent)
-		defer span.End(nil)
-	}
+	ctx, hooks := beginHooks(ctx, p.Tracer, p.Name, "agent.parallel."+p.Name, core.SpanAgent, sess)
+	defer hooks.End(ctx, nil)
 
 	var (
 		mu      sync.Mutex
@@ -60,10 +52,7 @@ func (p *ParallelAgent) run(ctx context.Context, sess *core.Session, ch chan<- c
 				return
 			}
 
-			var sigs []core.Signal
-			for s := range sub {
-				sigs = append(sigs, s)
-			}
+			sigs, _ := protocol.CollectAll(sub)
 
 			mu.Lock()
 			results[a.Identity()] = sigs
@@ -76,7 +65,7 @@ func (p *ParallelAgent) run(ctx context.Context, sess *core.Session, ch chan<- c
 	// Forward all signals from all agents
 	for _, agent := range p.Agents {
 		for _, s := range results[agent.Identity()] {
-			ch <- s
+			_ = w.Send(s)
 		}
 	}
 
@@ -97,6 +86,6 @@ func (p *ParallelAgent) run(ctx context.Context, sess *core.Session, ch chan<- c
 	}
 
 	if mergedText != "" {
-		ch <- core.Signal{Kind: core.SignalReply, Source: p.Name, Text: mergedText}
+		_ = w.Send(core.Signal{Kind: core.SignalReply, Source: p.Name, Text: mergedText})
 	}
 }

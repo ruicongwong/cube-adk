@@ -2,20 +2,32 @@ package vault
 
 import (
 	"context"
-	"strings"
 	"sync"
 
 	"cube-adk/pkg/core"
 )
 
-// MemVault is an in-memory Vault implementation for development and testing.
-type MemVault struct {
-	entries []core.Entry
-	mu      sync.RWMutex
+// MemVaultOption configures a MemVault.
+type MemVaultOption func(*MemVault)
+
+// WithRetriever sets the retrieval strategy. Default is KeywordRetriever.
+func WithRetriever(r core.Retriever) MemVaultOption {
+	return func(v *MemVault) { v.retriever = r }
 }
 
-func NewMemVault() *MemVault {
-	return &MemVault{}
+// MemVault is an in-memory Vault implementation for development and testing.
+type MemVault struct {
+	entries   []core.Entry
+	retriever core.Retriever
+	mu        sync.RWMutex
+}
+
+func NewMemVault(opts ...MemVaultOption) *MemVault {
+	v := &MemVault{retriever: NewKeywordRetriever()}
+	for _, o := range opts {
+		o(v)
+	}
+	return v
 }
 
 func (v *MemVault) Append(_ context.Context, entry core.Entry) error {
@@ -25,25 +37,13 @@ func (v *MemVault) Append(_ context.Context, entry core.Entry) error {
 	return nil
 }
 
-func (v *MemVault) Recall(_ context.Context, query string, limit int) ([]core.Fragment, error) {
+func (v *MemVault) Recall(ctx context.Context, query string, limit int) ([]core.Fragment, error) {
 	v.mu.RLock()
-	defer v.mu.RUnlock()
+	entries := make([]core.Entry, len(v.entries))
+	copy(entries, v.entries)
+	v.mu.RUnlock()
 
-	var results []core.Fragment
-	q := strings.ToLower(query)
-	for _, e := range v.entries {
-		if strings.Contains(strings.ToLower(e.Content), q) {
-			results = append(results, core.Fragment{
-				Content: e.Content,
-				Score:   1.0,
-				Source:  e.Tag,
-			})
-			if len(results) >= limit {
-				break
-			}
-		}
-	}
-	return results, nil
+	return v.retriever.Retrieve(ctx, entries, query, limit)
 }
 
 func (v *MemVault) Forget(_ context.Context, filter core.Filter) error {
@@ -53,7 +53,7 @@ func (v *MemVault) Forget(_ context.Context, filter core.Filter) error {
 	filtered := v.entries[:0]
 	for _, e := range v.entries {
 		if matchFilter(e, filter) {
-			continue // remove
+			continue
 		}
 		filtered = append(filtered, e)
 	}

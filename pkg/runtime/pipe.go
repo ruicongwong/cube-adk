@@ -1,41 +1,42 @@
 package runtime
 
-import "cube-adk/pkg/core"
+import (
+	"cube-adk/pkg/core"
+	"cube-adk/pkg/protocol"
+)
 
-// Collect drains a signal channel into a slice.
-func Collect(ch <-chan core.Signal) []core.Signal {
-	var out []core.Signal
-	for s := range ch {
-		out = append(out, s)
-	}
+// Collect drains a signal stream into a slice.
+func Collect(r *protocol.StreamReader[core.Signal]) []core.Signal {
+	out, _ := protocol.CollectAll(r)
 	return out
 }
 
-// Tap creates a pass-through channel that calls fn for each signal.
-func Tap(ch <-chan core.Signal, fn func(core.Signal)) <-chan core.Signal {
-	out := make(chan core.Signal)
-	go func() {
-		defer close(out)
-		for s := range ch {
-			fn(s)
-			out <- s
-		}
-	}()
-	return out
+// Tap creates a pass-through stream that calls fn for each signal.
+func Tap(r *protocol.StreamReader[core.Signal], fn func(core.Signal)) *protocol.StreamReader[core.Signal] {
+	return protocol.MapReader(r, func(s core.Signal) (core.Signal, error) {
+		fn(s)
+		return s, nil
+	})
 }
 
-// FilterKind returns a channel that only passes signals of the given kinds.
-func FilterKind(ch <-chan core.Signal, kinds ...core.SignalKind) <-chan core.Signal {
+// FilterKind returns a stream that only passes signals of the given kinds.
+func FilterKind(r *protocol.StreamReader[core.Signal], kinds ...core.SignalKind) *protocol.StreamReader[core.Signal] {
 	set := make(map[core.SignalKind]struct{}, len(kinds))
 	for _, k := range kinds {
 		set[k] = struct{}{}
 	}
-	out := make(chan core.Signal)
+	out, w := protocol.Pipe[core.Signal](0)
 	go func() {
-		defer close(out)
-		for s := range ch {
+		defer w.Finish(nil)
+		for {
+			s, err := r.Recv()
+			if err != nil {
+				return
+			}
 			if _, ok := set[s.Kind]; ok {
-				out <- s
+				if err := w.Send(s); err != nil {
+					return
+				}
 			}
 		}
 	}()

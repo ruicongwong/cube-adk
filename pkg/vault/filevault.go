@@ -15,17 +15,30 @@ import (
 
 // FileVault persists memory entries as JSON files on disk.
 type FileVault struct {
-	root string
-	mu   sync.RWMutex
+	root      string
+	retriever core.Retriever
+	mu        sync.RWMutex
 }
 
-func NewFileVault(root string) (*FileVault, error) {
+// FileVaultOption configures a FileVault.
+type FileVaultOption func(*FileVault)
+
+// WithFileRetriever sets the retrieval strategy for FileVault.
+func WithFileRetriever(r core.Retriever) FileVaultOption {
+	return func(v *FileVault) { v.retriever = r }
+}
+
+func NewFileVault(root string, opts ...FileVaultOption) (*FileVault, error) {
 	for _, dir := range []string{"working", "short", "long"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			return nil, fmt.Errorf("filevault: create dir %s: %w", dir, err)
 		}
 	}
-	return &FileVault{root: root}, nil
+	v := &FileVault{root: root, retriever: NewKeywordRetriever()}
+	for _, o := range opts {
+		o(v)
+	}
+	return v, nil
 }
 
 type fileEntry struct {
@@ -64,20 +77,26 @@ func (v *FileVault) Append(_ context.Context, entry core.Entry) error {
 	return os.WriteFile(filepath.Join(v.scopeDir(entry.Scope), name), data, 0o644)
 }
 
-func (v *FileVault) Recall(_ context.Context, query string, limit int) ([]core.Fragment, error) {
+func (v *FileVault) Recall(ctx context.Context, query string, limit int) ([]core.Fragment, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	q := strings.ToLower(query)
-	var results []core.Fragment
+	entries, err := v.loadAllEntries()
+	if err != nil {
+		return nil, err
+	}
+	return v.retriever.Retrieve(ctx, entries, query, limit)
+}
 
+func (v *FileVault) loadAllEntries() ([]core.Entry, error) {
+	var entries []core.Entry
 	for _, scope := range []core.Scope{core.ScopeWorking, core.ScopeShort, core.ScopeLong} {
 		dir := v.scopeDir(scope)
-		entries, err := os.ReadDir(dir)
+		des, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
-		for _, de := range entries {
+		for _, de := range des {
 			if !strings.HasSuffix(de.Name(), ".json") {
 				continue
 			}
@@ -89,19 +108,15 @@ func (v *FileVault) Recall(_ context.Context, query string, limit int) ([]core.F
 			if json.Unmarshal(data, &fe) != nil {
 				continue
 			}
-			if strings.Contains(strings.ToLower(fe.Content), q) {
-				results = append(results, core.Fragment{
-					Content: fe.Content,
-					Score:   1.0,
-					Source:  fe.Tag,
-				})
-				if len(results) >= limit {
-					return results, nil
-				}
-			}
+			entries = append(entries, core.Entry{
+				Scope:   scope,
+				Tag:     fe.Tag,
+				Content: fe.Content,
+				Meta:    fe.Meta,
+			})
 		}
 	}
-	return results, nil
+	return entries, nil
 }
 
 func (v *FileVault) Forget(_ context.Context, filter core.Filter) error {
@@ -115,11 +130,11 @@ func (v *FileVault) Forget(_ context.Context, filter core.Filter) error {
 
 	for _, scope := range scopes {
 		dir := v.scopeDir(scope)
-		entries, err := os.ReadDir(dir)
+		des, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
-		for _, de := range entries {
+		for _, de := range des {
 			if !strings.HasSuffix(de.Name(), ".json") {
 				continue
 			}

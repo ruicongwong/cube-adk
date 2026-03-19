@@ -37,27 +37,3 @@ func OnError(ctx context.Context, info RunInfo, err error) context.Context {
 	}
 	return ctx
 }
-
-// OnStartStream dispatches the OnStartStream event to all handlers in the context.
-func OnStartStream(ctx context.Context, info RunInfo, input any) context.Context {
-	guard := GuardFromContext(ctx)
-	if !guard.Active() {
-		return ctx
-	}
-	for _, h := range guard.Handlers() {
-		ctx = h.OnStartStream(ctx, info, input)
-	}
-	return ctx
-}
-
-// OnEndStream dispatches the OnEndStream event to all handlers in the context.
-func OnEndStream(ctx context.Context, info RunInfo, output any) context.Context {
-	guard := GuardFromContext(ctx)
-	if !guard.Active() {
-		return ctx
-	}
-	for _, h := range guard.Handlers() {
-		ctx = h.OnEndStream(ctx, info, output)
-	}
-	return ctx
-}

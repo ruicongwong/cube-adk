@@ -16,10 +16,11 @@ import (
 // DuckDuckGoTool searches the web using the DuckDuckGo Instant Answer API.
 type DuckDuckGoTool struct {
 	Client *http.Client
+	Opts   []option.ToolOption // default options applied on every Run
 }
 
-func NewDuckDuckGoTool() *DuckDuckGoTool {
-	return &DuckDuckGoTool{Client: &http.Client{}}
+func NewDuckDuckGoTool(opts ...option.ToolOption) *DuckDuckGoTool {
+	return &DuckDuckGoTool{Client: &http.Client{}, Opts: opts}
 }
 
 func (d *DuckDuckGoTool) Identity() string { return "ddg_search" }
@@ -42,6 +43,10 @@ func (d *DuckDuckGoTool) Spec() protocol.ToolSpec {
 }
 
 func (d *DuckDuckGoTool) Run(ctx context.Context, call protocol.ToolCall, opts ...option.ToolOption) (protocol.ToolResult, error) {
+	all := append(d.Opts, opts...)
+	ctx, cleanup, attempts := applyToolOpts(ctx, all...)
+	defer cleanup()
+
 	var args struct {
 		Query string `json:"query"`
 	}
@@ -52,11 +57,23 @@ func (d *DuckDuckGoTool) Run(ctx context.Context, call protocol.ToolCall, opts .
 		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: empty query")), nil
 	}
 
-	apiURL := "https://api.duckduckgo.com/?q=" + url.QueryEscape(args.Query) + "&format=json&no_html=1&skip_disambig=1"
+	var lastResult protocol.ToolResult
+	for i := range attempts {
+		result, retry := d.doSearch(ctx, call.ID, args.Query)
+		if !retry || i+1 >= attempts {
+			return result, nil
+		}
+		lastResult = result
+	}
+	return lastResult, nil
+}
+
+func (d *DuckDuckGoTool) doSearch(ctx context.Context, callID, query string) (protocol.ToolResult, bool) {
+	apiURL := "https://api.duckduckgo.com/?q=" + url.QueryEscape(query) + "&format=json&no_html=1&skip_disambig=1"
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, err), nil
+		return protocol.NewErrorResult(callID, err), true
 	}
 	req.Header.Set("User-Agent", "cube-adk/1.0")
 
@@ -66,20 +83,20 @@ func (d *DuckDuckGoTool) Run(ctx context.Context, call protocol.ToolCall, opts .
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: http: %w", err)), nil
+		return protocol.NewErrorResult(callID, fmt.Errorf("ddg: http: %w", err)), true
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, fmt.Errorf("ddg: read body: %w", err)), nil
+		return protocol.NewErrorResult(callID, fmt.Errorf("ddg: read body: %w", err)), true
 	}
 
-	output, err := formatDDGResponse(body, args.Query)
+	output, err := formatDDGResponse(body, query)
 	if err != nil {
-		return protocol.NewErrorResult(call.ID, err), nil
+		return protocol.NewErrorResult(callID, err), false
 	}
-	return protocol.NewTextResult(call.ID, output), nil
+	return protocol.NewTextResult(callID, output), false
 }
 
 type ddgResponse struct {

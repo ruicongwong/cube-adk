@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"cube-adk/pkg/callback"
 	"cube-adk/pkg/component"
 	"cube-adk/pkg/core"
 	"cube-adk/pkg/option"
@@ -35,24 +34,17 @@ func (a *SoloAgent) InjectTools(tools ...component.Tool) {
 
 func (a *SoloAgent) Identity() string { return a.Name }
 
-func (a *SoloAgent) Execute(ctx context.Context, sess *core.Session) (<-chan core.Signal, error) {
-	ch := make(chan core.Signal, 16)
-	go a.run(ctx, sess, ch)
-	return ch, nil
+func (a *SoloAgent) Execute(ctx context.Context, state *core.State) (*protocol.StreamReader[core.Signal], error) {
+	r, w := protocol.Pipe[core.Signal](16)
+	go a.run(ctx, state, w)
+	return r, nil
 }
 
-func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.Signal) {
-	defer close(ch)
+func (a *SoloAgent) run(ctx context.Context, sess *core.State, w *protocol.StreamWriter[core.Signal]) {
+	defer w.Finish(nil)
 
-	info := callback.RunInfo{Name: a.Name, Kind: "agent", Component: component.KindModel}
-	ctx = callback.OnStart(ctx, info, sess)
-	defer func() { callback.OnEnd(ctx, info, nil) }()
-
-	var span core.Span
-	if a.Tracer != nil {
-		ctx, span = a.Tracer.Start(ctx, "agent."+a.Name, core.SpanAgent)
-		defer span.End(nil)
-	}
+	ctx, hooks := beginHooks(ctx, a.Tracer, a.Name, "agent."+a.Name, core.SpanAgent, sess)
+	defer hooks.End(ctx, nil)
 
 	limit := a.StepLimit
 	if limit <= 0 {
@@ -67,7 +59,7 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 		specs = append(specs, t.Spec())
 	}
 
-	msgs := a.buildMessages(ctx, sess, ch)
+	msgs := a.buildMessages(ctx, sess, w)
 
 	for step := 0; step < limit; step++ {
 		if ctx.Err() != nil {
@@ -76,8 +68,8 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 
 		resp, err := a.Model.Generate(ctx, msgs, option.WithToolSpecs(specs...))
 		if err != nil {
-			callback.OnError(ctx, info, err)
-			emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
+			hooks.Error(ctx, err)
+			emit(w, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: err.Error()})
 			return
 		}
 
@@ -86,7 +78,7 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 			replyText := resp.TextOf()
 
 			if a.gateNeeded("reply") {
-				emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "reply"})
+				emit(w, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "reply"})
 				review, err := a.Gate.Check(ctx, core.Checkpoint{
 					Agent: a.Name, Kind: "reply", Input: replyText,
 				})
@@ -101,7 +93,7 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 				}
 			}
 
-			emit(ch, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: replyText})
+			emit(w, core.Signal{Kind: core.SignalReply, Source: a.Name, Text: replyText})
 			sess.Append(protocol.NewTextMessage("assistant", replyText))
 			if a.Vault != nil {
 				_ = a.Vault.Append(ctx, core.Entry{
@@ -112,13 +104,13 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 		}
 
 		if text := resp.TextOf(); text != "" {
-			emit(ch, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: text})
+			emit(w, core.Signal{Kind: core.SignalThink, Source: a.Name, Text: text})
 		}
 
 		msgs = append(msgs, resp)
 
 		for _, tc := range resp.ToolCalls {
-			emit(ch, core.Signal{
+			emit(w, core.Signal{
 				Kind: core.SignalInvoke, Source: a.Name,
 				Invoke: &protocol.ToolCall{ID: tc.ID, Kind: tc.Kind, Name: tc.Name, Args: tc.Args},
 			})
@@ -128,18 +120,18 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 				var hArgs struct{ Target string }
 				if err := json.Unmarshal([]byte(tc.Args), &hArgs); err == nil && hArgs.Target != "" {
 					if a.gateNeeded("handoff") {
-						emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "handoff:" + hArgs.Target})
+						emit(w, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "handoff:" + hArgs.Target})
 						review, err := a.Gate.Check(ctx, core.Checkpoint{
 							Agent: a.Name, Kind: "handoff", Tool: hArgs.Target, Input: tc.Args,
 						})
 						if err == nil && review.Verdict == core.Reject {
 							result := protocol.NewErrorResult(tc.ID, fmt.Errorf("handoff rejected: %s", review.Reason))
-							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+							emit(w, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
 							msgs = append(msgs, toolResultMsg(result))
 							continue
 						}
 					}
-					emit(ch, core.Signal{Kind: core.SignalHandoff, Source: a.Name, Handoff: hArgs.Target})
+					emit(w, core.Signal{Kind: core.SignalHandoff, Source: a.Name, Handoff: hArgs.Target})
 					return
 				}
 			}
@@ -147,7 +139,7 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 			t, ok := toolMap[tc.Name]
 			if !ok {
 				result := protocol.NewErrorResult(tc.ID, fmt.Errorf("unknown tool: %s", tc.Name))
-				emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+				emit(w, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
 				msgs = append(msgs, toolResultMsg(result))
 				continue
 			}
@@ -157,13 +149,13 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 			if a.gateNeeded("tool") {
 				cp := core.Checkpoint{Agent: a.Name, Kind: "tool", Tool: tc.Name, Input: tc.Args}
 				if a.Policy.NeedsReview(cp) {
-					emit(ch, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + tc.Name})
+					emit(w, core.Signal{Kind: core.SignalGate, Source: a.Name, Text: "tool:" + tc.Name})
 					review, err := a.Gate.Check(ctx, cp)
 					if err == nil {
 						switch review.Verdict {
 						case core.Reject:
 							result := protocol.NewErrorResult(tc.ID, fmt.Errorf("rejected: %s", review.Reason))
-							emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+							emit(w, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
 							msgs = append(msgs, toolResultMsg(result))
 							continue
 						case core.Modify:
@@ -174,12 +166,12 @@ func (a *SoloAgent) run(ctx context.Context, sess *core.Session, ch chan<- core.
 			}
 
 			result, _ := t.Run(ctx, callToRun)
-			emit(ch, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
+			emit(w, core.Signal{Kind: core.SignalYield, Source: a.Name, Yield: &result})
 			msgs = append(msgs, toolResultMsg(result))
 		}
 	}
 
-	emit(ch, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: "step limit reached"})
+	emit(w, core.Signal{Kind: core.SignalFault, Source: a.Name, Text: "step limit reached"})
 }
 
 func (a *SoloAgent) gateNeeded(kind string) bool {
@@ -189,7 +181,7 @@ func (a *SoloAgent) gateNeeded(kind string) bool {
 	return a.Policy.NeedsReview(core.Checkpoint{Kind: kind})
 }
 
-func (a *SoloAgent) buildMessages(ctx context.Context, sess *core.Session, ch chan<- core.Signal) []*protocol.Message {
+func (a *SoloAgent) buildMessages(ctx context.Context, sess *core.State, w *protocol.StreamWriter[core.Signal]) []*protocol.Message {
 	var msgs []*protocol.Message
 
 	if a.Persona != "" {
@@ -208,7 +200,7 @@ func (a *SoloAgent) buildMessages(ctx context.Context, sess *core.Session, ch ch
 				}
 				recallText := "Recalled from memory:\n" + strings.Join(parts, "\n---\n")
 				msgs = append(msgs, protocol.NewTextMessage("system", recallText))
-				emit(ch, core.Signal{
+				emit(w, core.Signal{
 					Kind: core.SignalRecall, Source: a.Name,
 					Recall: &core.RecallDetail{Query: query, Fragments: frags},
 				})
@@ -229,8 +221,8 @@ func lastUserQuery(history []*protocol.Message) string {
 	return ""
 }
 
-func emit(ch chan<- core.Signal, s core.Signal) {
-	ch <- s
+func emit(w *protocol.StreamWriter[core.Signal], s core.Signal) {
+	_ = w.Send(s)
 }
 
 // toolResultMsg creates a tool-role message from a ToolResult.
